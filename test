@@ -1,0 +1,5304 @@
+kong/cluster_events/mysql.lua
+
+local utils  = require "kong.tools.utils"
+local mysql = require "kong.tools.mysql"
+local pgmoon = require "pgmoon"
+
+
+local max          = math.max
+local fmt          = string.format
+local null         = ngx.null
+local concat       = table.concat
+local setmetatable = setmetatable
+local new_tab
+do
+  local ok
+  ok, new_tab = pcall(require, "table.new")
+  if not ok then
+    new_tab = function(narr, nrec) return {} end
+  end
+end
+
+
+local INSERT_QUERY = [[
+INSERT INTO cluster_events(`id`, `node_id`, at, nbf, expire_at, channel, data)
+ VALUES(%s, %s, FROM_UNIXTIME(%f), FROM_UNIXTIME(%s), FROM_UNIXTIME(%s), %s, %s)
+]]
+
+local SELECT_INTERVAL_QUERY = [[
+SELECT `id`, `node_id`, channel, data, UNIX_TIMESTAMP(at) as at, UNIX_TIMESTAMP(nbf) as  nbf
+FROM cluster_events
+WHERE channel IN (%s)
+  AND at >  FROM_UNIXTIME(%f)
+  AND at <= FROM_UNIXTIME(%f)
+]]
+
+
+local _M = {}
+local mt = { __index = _M }
+
+
+function _M.new(db, page_size, event_ttl)
+  local self  = {
+    db        = db.connector,
+    --page_size = page_size,
+    event_ttl = event_ttl,
+  }
+
+  return setmetatable(self, mt)
+end
+
+
+function _M.should_use_polling()
+  return true
+end
+
+function _M:insert(node_id, channel, at, data, nbf)
+  local expire_at = max(at + self.event_ttl, at)
+
+  if not nbf then
+    nbf = "NULL"
+  end
+
+  local my_id      = ngx.quote_sql_str(utils.uuid())
+  local my_node_id = ngx.quote_sql_str(node_id)
+  local my_channel = ngx.quote_sql_str(channel)
+  local my_data    = ngx.quote_sql_str(data)
+
+  local q = fmt(INSERT_QUERY, my_id, my_node_id, at, nbf, expire_at,
+    my_channel, my_data)
+
+  local res, err = self.db:query(q)
+  if not res then
+    return nil, "could not insert invalidation row: " .. err
+  end
+
+  return true
+end
+
+
+function _M:select_interval(channels, min_at, max_at)
+  local n_chans = #channels
+  local my_channels = new_tab(n_chans, 0)
+
+  for i = 1, n_chans do
+    my_channels[i] = pgmoon.Postgres.escape_literal(nil, channels[i])
+  end
+
+  local q = fmt(SELECT_INTERVAL_QUERY, concat(my_channels, ","), min_at,
+    max_at)
+
+  local ran
+
+  -- TODO: implement pagination for this strategy as
+  -- well.
+  --
+  -- we need to behave like lua-cassandra's iteration:
+  -- provide an iterator that enters the loop, with a
+  -- page = 0 argument if there is no first page, and a
+  -- page = 1 argument with the fetched rows elsewise
+
+  return function(_, p_rows)
+    if ran then
+      return nil
+    end
+
+    local res, err = self.db:query(q)
+    if not res then
+      return nil, err
+    end
+
+    local len = #res
+    for i = 1, len do
+      local row = res[i]
+      if row.nbf == null then
+        row.nbf = nil
+      end
+    end
+
+    local page = len > 0 and 1 or 0
+
+    ran = true
+
+    return res, err, page
+  end
+end
+
+
+function _M:truncate_events()
+  return self.db:query("TRUNCATE cluster_events")
+end
+
+
+return _M
+
+---------------------
+
+kong/db/migrations/core/base.lua
+
+mysql = {
+    up = [[
+      CREATE TABLE `cluster_events` (
+      `id`        varchar(50) PRIMARY KEY,
+      `node_id`   varchar(50) NOT NULL,
+      `at`        timestamp NOT NULL,
+      `nbf`       timestamp,
+      `expire_at` timestamp NOT NULL,
+      `channel`   varchar(512),
+      `data`      text,
+      INDEX       idx_cluster_events_at (`at`),
+      INDEX       idx_cluster_events_channel (`channel`)
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+      
+      DROP EVENT IF EXISTS delete_expired_cluster_events_event;
+      CREATE EVENT delete_expired_cluster_events_event
+        ON SCHEDULE EVERY 1 HOUR
+        ON COMPLETION PRESERVE
+        DO
+        BEGIN
+          DELETE
+          FROM cluster_events
+          WHERE expire_at <= CURRENT_TIMESTAMP();
+        END;
+
+
+      CREATE TABLE `services` (
+      `id`              varchar(50)  PRIMARY KEY,
+      `created_at`      timestamp,
+      `updated_at`      timestamp,
+      `name`            text,
+      `retries`         int8,
+      `protocol`        text ,
+      `host`            text ,
+      `port`            int8,
+      `path`            text ,
+      `connect_timeout` int8,
+      `write_timeout`   int8,
+      `read_timeout`    int8,
+      `tags`            text,
+      `client_certificate_id`  varchar(50),
+      UNIQUE INDEX `services_name_index` (`name`(50)),
+      INDEX `services_tags_index` (`tags`(256)),
+      INDEX `services_client_certificate_id_index` (`client_certificate_id`(50))
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+
+
+      CREATE TABLE `routes` (
+      `id`                          varchar(50) PRIMARY KEY,
+      `created_at`                  timestamp,
+      `updated_at`                  timestamp,
+      `service_id`                  varchar(50),
+      `protocols`                   text,-- #Becareful it is text[] format
+      `methods`                     text,-- #Becareful it is text[] format
+      `hosts`                       text,-- #Becareful it is text[] format
+      `paths`                       text,-- #Becareful it is text[] format
+      `regex_priority`              int8,
+      `strip_path`                  bool,
+      `preserve_host`               bool,
+      `name`                        text,
+      `snis`                        text, -- #Becareful it is text[] format
+      `sources`                     text, -- #Becareful it is jsonb[] format
+      `destinations`                text, -- #Becareful it is jsonb[] format
+      `tags`                        text,
+      `https_redirect_status_code`  int8,
+      `headers`                     text,
+      UNIQUE INDEX `routes_name_index` (`name`(50)),
+      INDEX `routes_service_id_index` (`service_id`(50)),
+      INDEX `routes_tags_index` (`tags`(256)),
+      CONSTRAINT `routes_service_id_fkey` FOREIGN KEY (`service_id`) REFERENCES `services` (`id`) ON DELETE CASCADE
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+
+      CREATE TABLE `apis` (
+      `id`                        varchar(50) PRIMARY KEY,
+      `created_at`                timestamp NOT NULL,
+      `name`                      text ,
+      `upstream_url`              text ,
+      `preserve_host`             bool NOT NULL,
+      `retries`                   int2 DEFAULT 5,
+      `https_only`                bool,
+      `http_if_terminated`        bool,
+      `hosts`                     text,
+      `uris`                      text,
+      `methods`                   text,
+      `strip_uri`                 bool,
+      `upstream_connect_timeout`  int4,
+      `upstream_send_timeout`     int4,
+      `upstream_read_timeout`     int4,
+      UNIQUE INDEX `apis_name_unique_index` (`name`(50))
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+
+      CREATE TABLE `certificates` (
+      `id`         varchar(50) PRIMARY KEY,
+      `created_at` timestamp NOT NULL,
+      `cert`       text ,
+      `key`        text,
+      `tags`       text,
+      INDEX  `certificates_tags_index` (`tags`(256))
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+
+      CREATE TABLE `snis` (
+      `id`             varchar(50) PRIMARY KEY,
+      `created_at`     timestamp NOT NULL,
+      `name`           text  NOT NULL,
+      `certificate_id` varchar(50),
+      `tags`           text,
+      UNIQUE INDEX `snis_name_unique_index` (`name`(50)),
+      INDEX  `snis_tags_index` (`tags`(256)),
+      INDEX  `snis_certificate_id_index` (`certificate_id`(50)),
+      CONSTRAINT `snis_certificate_id_fkey` FOREIGN KEY (`certificate_id`) REFERENCES `certificates` (`id`) ON DELETE CASCADE
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+
+      CREATE TABLE `consumers` (
+      `id`         varchar(50) PRIMARY KEY,
+      `created_at` timestamp NOT NULL,
+      `username`   text ,
+      `custom_id`  text,
+      `tags`       text,
+      UNIQUE  INDEX  `consumers_username_unique_index`  (`username`(128)),
+      UNIQUE  INDEX  `consumers_custom_id_unique_index` (`custom_id`(128)),
+      INDEX  `consumers_tags_index`   (`tags`(256))
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+
+      CREATE TABLE `plugins` (
+      `id`           varchar(50) PRIMARY KEY,
+      `created_at`   timestamp NOT NULL,
+      `name`         text  NOT NULL,
+      `consumer_id`  varchar(50),
+      `service_id`   varchar(50),
+      `route_id`     varchar(50),
+      `api_id`       varchar(50),
+      `config`       text NOT NULL, -- #Becareful it is jsonb format
+      `enabled`      bool NOT NULL,
+      `cache_key`    text,
+      `run_on`       text,
+      `protocols`    text,
+      `tags`         text,
+      UNIQUE INDEX `plugins_cache_key_key` (`cache_key`(50)),
+      INDEX `plugins_api_id_idx` (`api_id`(50)),
+      INDEX `plugins_consumer_id_idx` (`consumer_id`(50)),
+      INDEX `plugins_name_idx` (`name`(50)),
+      INDEX `plugins_route_id_idx` (`route_id`(50)),
+      INDEX `plugins_run_on_idx` (`run_on`(50)),
+      INDEX `plugins_service_id_idx` (`service_id`(50)),
+      INDEX `plugins_tags_idx` (`tags`(256)),
+      CONSTRAINT `plugins_api_id_fkey` FOREIGN KEY (`api_id`) REFERENCES `apis` (`id`) ON DELETE CASCADE,
+      CONSTRAINT `plugins_consumer_id_fkey` FOREIGN KEY (`consumer_id`) REFERENCES `consumers` (`id`) ON DELETE CASCADE,
+      CONSTRAINT `plugins_route_id_fkey` FOREIGN KEY (`route_id`) REFERENCES `routes` (`id`) ON DELETE CASCADE,
+      CONSTRAINT `plugins_service_id_fkey` FOREIGN KEY (`service_id`) REFERENCES `services` (`id`) ON DELETE CASCADE
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+
+      CREATE TABLE `upstreams` (
+      `id`                    varchar(50) PRIMARY KEY,
+      `created_at`            timestamp NOT NULL,
+      `name`                  text ,
+      `hash_on`               text ,
+      `hash_fallback`         text ,
+      `hash_on_header`        text ,
+      `hash_fallback_header`  text,
+      `hash_on_cookie`        text ,
+      `hash_on_cookie_path`   text ,
+      `slots`                 int4 NOT NULL,
+      `healthchecks`          text, -- #Becareful it is jsonb format
+      `tags`                  text,
+      `algorithm`             text,
+      UNIQUE INDEX `upstreams_name_key` (`name`(50)),
+      INDEX `upstreams_tags_idx` (`tags`(256))
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+
+      CREATE TABLE `targets` (
+      `id`           varchar(50) PRIMARY KEY,
+      `created_at`   timestamp NOT NULL,
+      `upstream_id`  varchar(50),
+      `target`       text  NOT NULL,
+      `weight`       int4 NOT NULL,
+      `tags`         text,
+      INDEX `targets_target_idx` (`target`(50)),
+      INDEX `targets_upstream_id_idx` (`upstream_id`(50)),
+      INDEX `targets_tags_idx` (`tags`(256)),
+      CONSTRAINT `targets_upstream_id_fkey` FOREIGN KEY (`upstream_id`) REFERENCES `upstreams` (`id`) ON DELETE CASCADE
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+
+      CREATE TABLE `ttls` (
+      `primary_key_value`   varchar(200)  NOT NULL,
+      `primary_uuid_value`  varchar(50),
+      `table_name`          varchar(100)  NOT NULL,
+      `primary_key_name`    varchar(100)  NOT NULL,
+      `expire_at`           timestamp NOT NULL,
+      PRIMARY KEY(`primary_key_value`, `table_name`),
+      INDEX `ttls_primary_uuid_value_idx` (`primary_uuid_value`(50))
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+
+      CREATE TABLE `cluster_ca` (
+      `pk`   bool NOT NULL PRIMARY KEY CHECK(pk=true),
+      `key`  text NOT NULL,
+      `cert` text NOT NULL
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+      CREATE TABLE `ca_certificates` (
+      `id`           varchar(50) PRIMARY KEY,
+      `created_at`   timestamp NOT NULL,
+      `cert`         text NOT NULL,
+      `tags`         text,
+      INDEX  `ca_certificates_tags_idx` (`tags`(256)),
+      UNIQUE INDEX  `ca_certificates_cert_unique_index` (`cert`(256))
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+
+      CREATE TABLE `tags` (
+      `entity_id`     varchar(50) PRIMARY KEY,
+      `entity_name`   timestamp NOT NULL,
+      `tags`          text,
+      INDEX  `tags_tags_idx` (`tags`(256)),
+      INDEX  `tags_entity_name_idx` (`entity_name`)
+      ) ENGINE=INNODB DEFAULT CHARSET=utf8;
+    ]]
+  },
+  
+  
+------------------
+
+kong\db\strategies\mysql\connector.lua
+
+local logger = require "kong.cmd.utils.log"
+local mysql = require "kong.tools.mysql"
+local cjson = require "cjson"
+local cjson_safe = require "cjson.safe"
+local stringx = require "pl.stringx"
+local semaphore    = require "ngx.semaphore"
+local kong = kong
+
+local setmetatable = setmetatable
+local encode_array = cjson.encode
+local tonumber = tonumber
+local tostring = tostring
+local concat = table.concat
+local ipairs = ipairs
+local pairs = pairs
+local error = error
+local floor = math.floor
+local type = type
+local ngx = ngx
+local timer_every = ngx.timer.every
+local update_time = ngx.update_time
+local get_phase = ngx.get_phase
+local null = ngx.null
+local now = ngx.now
+local log = ngx.log
+local match = string.match
+local fmt = string.format
+local sub = string.sub
+
+local WARN = ngx.WARN
+local SQL_INFORMATION_SCHEMA_TABLES = [[
+SELECT table_name
+  FROM information_schema.tables;
+]]
+local PROTECTED_TABLES = {
+  schema_migrations = true,
+  schema_meta = true,
+  locks = true,
+}
+
+local function now_updated()
+  update_time()
+  return now()
+end
+
+local function visit(k, n, m, s)
+  if m[k] == 0 then
+    return 1
+  end
+  if m[k] == 1 then
+    return
+  end
+  m[k] = 0
+  local f = n[k]
+  for i = 1, #f do
+    if visit(f[i], n, m, s) then
+      return 1
+    end
+  end
+  m[k] = 1
+  s[#s + 1] = k
+end
+
+local tsort = {}
+tsort.__index = tsort
+
+function tsort.new()
+  return setmetatable({ n = {} }, tsort)
+end
+
+function tsort:add(...)
+  local p = { ... }
+  local c = #p
+  if c == 0 then
+    return self
+  end
+  if c == 1 then
+    p = p[1]
+    if type(p) == "table" then
+      c = #p
+    else
+      p = { p }
+    end
+  end
+  local n = self.n
+  for i = 1, c do
+    local f = p[i]
+    if n[f] == nil then
+      n[f] = {}
+    end
+  end
+  for i = 2, c, 1 do
+    local f = p[i]
+    local t = p[i - 1]
+    local o = n[f]
+    o[#o + 1] = t
+  end
+  return self
+end
+
+function tsort:sort()
+  local n = self.n
+  local s = {}
+  local m = {}
+  for k in pairs(n) do
+    if m[k] == nil then
+      if visit(k, n, m, s) then
+	return nil, "There is a circular dependency in the graph. It is not possible to derive a topological sort."
+      end
+    end
+  end
+  return s
+end
+
+local function iterator(rows)
+  local i = 0
+  return function()
+    i = i + 1
+    return rows[i]
+  end
+end
+
+
+local function get_table_names(self, excluded)
+  local i = 0
+  local table_names = {}
+  for row, err in self:iterate(SQL_INFORMATION_SCHEMA_TABLES) do
+    if err then
+      return nil, err
+    end
+
+    if not excluded or not excluded[row.table_name] then
+      i = i + 1
+      table_names[i] = self:escape_identifier(row.table_name)
+    end
+  end
+
+  return table_names
+end
+
+
+local function reset_schema(self)
+  local table_names, err = get_table_names(self)
+  if not table_names then
+    return nil, err
+  end
+
+  local drop_tables
+  if #table_names == 0 then
+    drop_tables = ""
+  else
+    drop_tables = concat {
+      "    DROP TABLE IF EXISTS ", concat(table_names, ", "), " CASCADE;\n"
+    }
+  end
+
+  local schema = self:escape_identifier(self.config.schema)
+  local ok, err = self:query(concat {
+    "BEGIN;\n",
+    "  DO $$\n",
+    "  BEGIN\n",
+    "    DROP SCHEMA IF EXISTS ", schema, " CASCADE;\n",
+    "    CREATE SCHEMA IF NOT EXISTS ", schema, " AUTHORIZATION CURRENT_USER;\n",
+    "    GRANT ALL ON SCHEMA ", schema ," TO CURRENT_USER;\n",
+    "  EXCEPTION WHEN insufficient_privilege THEN\n", drop_tables,
+    "  END;\n",
+    "  $$;\n",
+    "    SET SCHEMA ",  self:escape_literal(self.config.schema), ";\n",
+    "COMMIT;",  })
+
+  if not ok then
+    return nil, err
+  end
+
+  return true
+end
+
+
+local setkeepalive
+
+local function connect(config)
+  local phase = get_phase()
+  if phase == "preread" or phase == "init" or phase == "init_worker" or ngx.IS_CLI then
+    -- Force LuaSocket usage in the CLI in order to allow for self-signed
+    -- certificates to be trusted (via opts.cafile) in the resty-cli
+    -- interpreter (no way to set lua_ssl_trusted_certificate).
+    config.socket_type = "luasocket"
+
+  else
+    config.socket_type = "nginx"
+  end
+
+  local connection = mysql.new(config)
+
+  connection.convert_null = true
+  connection.NULL = null
+
+  if config.timeout then
+    connection:set_timeout(config.timeout)
+  end
+
+  local ok, err = connection:connect(config)
+  if not ok then
+    return nil, err
+  end
+
+  -- TODO:去掉ok
+  --if connection.sock:getreusedtimes() == 0 then
+  --  if config.schema == "" then
+  --
+  --    local res = connection:query("SELECT CURRENT_SCHEMA AS schema")
+  --    if res and res[1] and res[1].schema and res[1].schema ~= null then
+  --      config.schema = res[1].schema
+  --    else
+  --      config.schema = "public"
+  --    end
+  --  end
+  --
+  --  ok, err = connection:query(concat {
+  --    "SET SCHEMA ",    connection:escape_literal(config.schema), ";\n",
+  --    --"SET TIME ZONE ", connection:escape_literal("UTC"), ";",
+  --  })
+  --  if not ok then
+  --    setkeepalive(connection)
+  --    return nil, err
+  --  end
+  --end
+
+  return connection
+end
+
+local function close(connection)
+  if not connection or not connection.sock then
+    return nil, "no active connection"
+  end
+
+  local ok, err = connection:close()
+  if not ok then
+    if err then
+      log(WARN, "unable to close mysql connection (", err, ")")
+
+    else
+      log(WARN, "unable to close mysql connection")
+    end
+
+    return nil, err
+  end
+
+  return true
+end
+
+setkeepalive = function(connection)
+  if not connection or not connection.sock then
+    return nil, "no active connection"
+  end
+
+  local ok, err
+  if connection.sock_type == "luasocket" then
+    ok, err = connection:close()
+    if not ok then
+      if err then
+	log(WARN, "unable to close mysql connection (", err, ")")
+
+      else
+	log(WARN, "unable to close mysql connection")
+      end
+
+      return nil, err
+    end
+
+  else
+    ok, err = connection:set_keepalive(1000, 10)
+    if not ok then
+      if err then
+	log(WARN, "unable to set keepalive for mysql connection (", err, ")")
+
+      else
+	log(WARN, "unable to set keepalive for mysql connection")
+      end
+
+      return nil, err
+    end
+  end
+
+  return true
+end
+
+local _mt = {
+  reset = reset_schema
+}
+
+_mt.__index = _mt
+
+function _mt:get_stored_connection()
+  local conn = self.super.get_stored_connection(self)
+  if conn and conn.sock then
+    return conn
+  end
+end
+
+-- TODO: 没有，理解在干吗
+function _mt:init()
+  -- [COMMENT] 获取数据库版本信息
+  local ver
+  local connection = self:get_stored_connection()
+  if connection then
+    ver = connection:server_ver()
+  else
+    connection, err = connect(self.config)
+    if not connection then
+      return nil, err
+    end
+
+    ver = connection:server_ver()
+  end
+
+  self.major_version = ver
+  self.major_minor_version = ver
+
+  return true
+end
+
+function _mt:init_worker(strategies)
+  -- TODO
+  if ngx.worker.id() == 0 then
+    local graph
+    local found = false
+
+    for _, strategy in pairs(strategies) do
+      local schema = strategy.schema
+      if schema.ttl then
+	if not found then
+	  graph = tsort.new()
+	  found = true
+	end
+
+	local name = schema.name
+	graph:add(name)
+	for _, field in schema:each_field() do
+	  if field.type == "foreign" and field.schema.ttl then
+	    graph:add(name, field.schema.name)
+	  end
+	end
+      end
+    end
+
+    if not found then
+      return true
+    end
+
+    local sorted_strategies = graph:sort()
+    local ttl_escaped = self:escape_identifier("ttl")
+    local cleanup_statement = {}
+    local cleanup_statements_count = #sorted_strategies
+    for i = 1, cleanup_statements_count do
+      local table_name = sorted_strategies[i]
+      cleanup_statement[i] = concat {
+	"  DELETE FROM ",
+	self:escape_identifier(table_name),
+	" WHERE ",
+	ttl_escaped,
+  -- TODO:需要接zone吗？
+	" < CURRENT_TIMESTAMP ;"
+	--" < CURRENT_TIMESTAMP AT TIME ZONE 'UTC';"
+      }
+    end
+
+    cleanup_statement = concat(cleanup_statement, "\n")
+
+    --return timer_every(60, function(premature)
+    --  if premature then
+	--      return
+    --  end
+    --
+    --  local ok, err = self:query(cleanup_statement)
+    --  if not ok then
+	--if err then
+	--  log(WARN, "unable to clean expired rows from mysql database (", err, ")")
+	--else
+	--  log(WARN, "unable to clean expired rows from mysql database")
+	--end
+    --  end
+    --end)
+
+    return timer_every(60, function(premature)
+      if premature then
+        return
+      end
+
+      local ok, _, _, num_queries = self:query(cleanup_statement)
+      if not ok then
+        for i = num_queries + 1, cleanup_statements_count do
+          local statement = cleanup_statements[i]
+          local ok, err = self:query(statement)
+          if not ok then
+            if err then
+              log(WARN, "unable to clean expired rows from table '",
+                sorted_strategies[i], "' on postgres database (",
+                err, ")")
+            else
+              log(WARN, "unable to clean expired rows from table '",
+                sorted_strategies[i], "' on postgres database")
+            end
+          end
+        end
+      end
+    end)
+  end
+
+  return true
+end
+
+function _mt:infos()
+  -- [COMMENT] return 默认设置的数据库信息
+  --local db_ver
+  --if self.major_minor_version then
+  --  db_ver = match(self.major_minor_version, "^(%d+%.%d+)")
+  --end
+
+  return {
+    strategy = "MySQL",
+    db_name = self.config.database,
+    db_schema = self.config.schema,
+    db_desc = "database",
+    db_ver = "5.7",
+  }
+end
+
+function _mt:connect()
+  local conn = self:get_stored_connection()
+  if conn then
+    return conn
+  end
+
+  local connection, err = connect(self.config)
+  if not connection then
+    return nil, err
+  end
+
+  self:store_connection(connection)
+
+  return connection
+end
+
+function _mt:connect_migrations()
+  return self:connect()
+end
+
+function _mt:close()
+  local conn = self:get_stored_connection()
+  if not conn then
+    return true
+  end
+
+  local ok, err = close(conn)
+
+  self:store_connection(nil)
+
+  if not ok then
+    return nil, err
+  end
+
+  return true
+end
+
+function _mt:setkeepalive()
+  local conn = self:get_stored_connection()
+  if not conn then
+    return true
+  end
+
+  local _, err = setkeepalive(conn)
+
+  self:store_connection(nil)
+
+  if err then
+    return nil, err
+  end
+
+  return true
+end
+
+function _mt:acquire_query_semaphore_resource()
+  if not self.sem then
+    return true
+  end
+
+  do
+    local phase = get_phase()
+    if phase == "init" or phase == "init_worker" then
+      return true
+    end
+  end
+
+  local ok, err = self.sem:wait(self.config.sem_timeout)
+  if not ok then
+    return nil, err
+  end
+
+  return true
+end
+
+
+function _mt:release_query_semaphore_resource()
+  if not self.sem then
+    return true
+  end
+
+  do
+    local phase = get_phase()
+    if phase == "init" or phase == "init_worker" then
+      return true
+    end
+  end
+
+  self.sem:post()
+end
+
+
+-- TODO: 需要重新梳理
+function _mt:query(sql)
+  local res, err, partial, num_queries
+  logger.debug("SQL:%s", sql)
+
+  local ok
+  ok, err = self:acquire_query_semaphore_resource()
+  if not ok then
+    return nil, "error acquiring query semaphore: " .. err
+  end
+
+  local conn = self:get_stored_connection()
+  if conn then
+    res, err, partial, num_queries = conn:query(sql)
+
+    while err == "again" do
+      res, err = conn:read_result()
+      if not res then
+	      return res, err
+      end
+    end
+
+  else
+    local connection
+    connection, err = connect(self.config)
+    if not connection then
+      self:release_query_semaphore_resource()
+      return nil, err
+    end
+
+    res, err, partial, num_queries = connection:query(sql)
+
+    -- [COMMENT] 数据库请求数据处理--数据类型转换、字符串 转 table
+    if res and #res > 0 then
+      for i = 1, #res do
+	if type(res[i]) == "table" then
+	  for k, v in pairs(res[i]) do
+	    if k == 'created_at' or k == 'updated_at' then
+	      local resTmpe, err = connection:query('SELECT UNIX_TIMESTAMP(\"' .. v .. '\") AS tmp;')
+	      if resTmpe and resTmpe[1] then
+		res[i][k] = tonumber(resTmpe[1]['tmp'])
+	      end
+	    elseif k == 'regex_priority' then
+	      res[i][k] = tonumber(v)
+	    elseif k == 'retries' then
+	      res[i][k] = tonumber(v)
+	    elseif k == 'strip_path' or k == 'preserve_host' then
+	      res[i][k] = true
+	      if v == 0 then
+		res[i][k] = false
+	      end
+	    elseif type(v) == "string" then
+	      local m = cjson_safe.decode(v)
+	      if type(m) == "table" then
+		res[i][k] = m
+	      end
+	    end
+	  end
+	end
+      end
+    end
+
+    while err == "again" do
+      res, err = connection:read_result()
+      if not res then
+	return res, err
+      end
+    end
+
+    setkeepalive(connection)
+  end
+
+  self:release_query_semaphore_resource()
+
+  if res then
+    return res, nil, partial, num_queries or err
+  end
+
+  return nil, err, partial, num_queries
+end
+
+function _mt:iterate(sql)
+  local res, err, partial, num_queries = self:query(sql)
+  if not res then
+    local failed = false
+    return function()
+      if not failed then
+        failed = true
+        return false, err, partial, num_queries
+      end
+      -- return error only once to avoid infinite loop
+      return nil
+    end
+  end
+
+  if res == true then
+    return iterator { true }
+  end
+
+  return iterator(res)
+end
+
+--function _mt:reset()
+--  local user = self:escape_identifier(self.config.user)
+--  local ok, err = self:query(concat {
+--    "  DROP SCHEMA IF EXISTS public CASCADE;\n",
+--    "  CREATE SCHEMA IF NOT EXISTS public AUTHORIZATION ", user, ";\n",
+--    "  GRANT ALL ON SCHEMA public TO ", user, ";",
+--  })
+--
+--  if not ok then
+--    return nil, err
+--  end
+--
+--  return true
+--end
+
+function _mt:truncate()
+  local table_names, err = get_table_names(self, PROTECTED_TABLES)
+  if not table_names then
+    return nil, err
+  end
+
+  if #table_names == 0 then
+    return true
+  end
+
+  local truncate_statement = concat {
+    "TRUNCATE ", concat(table_names, ", "), " RESTART IDENTITY CASCADE;"
+  }
+
+  local ok, err = self:query(truncate_statement)
+  if not ok then
+    return nil, err
+  end
+
+  return true
+end
+
+function _mt:truncate_table(table_name)
+  local truncate_statement = concat {
+    "TRUNCATE ", self:escape_identifier(table_name), " RESTART IDENTITY CASCADE;"
+  }
+
+  local ok, err = self:query(truncate_statement)
+  if not ok then
+    return nil, err
+  end
+
+  return true
+end
+
+function _mt:setup_locks(_, _)
+  logger.verbose("creating 'locks' table if not existing...")
+
+  local ok, err = self:query([[
+    CREATE TABLE IF NOT EXISTS locks (
+      `key`    varchar(50) PRIMARY KEY,
+      `owner`  varchar(50),
+      `ttl`    TIMESTAMP,
+      INDEX locks_ttl_idx(ttl)
+    ) ENGINE=INNODB DEFAULT CHARSET=utf8;]])
+
+  if not ok then
+    return nil, err
+  end
+
+  logger.verbose("successfully created 'locks' table")
+
+  return true
+end
+
+function _mt:insert_lock(key, ttl, owner)
+  local ttl_escaped = concat {
+    "FROM_UNIXTIME(",
+    self:escape_literal(tonumber(fmt("%.3f", now_updated() + ttl))),
+    ")"
+  }
+
+  local sql = concat { "DELETE FROM locks\n",
+		       "      WHERE ttl < CURRENT_TIMESTAMP;\n",
+		       "INSERT INTO locks (`key`, `owner`, `ttl`)\n",
+		       "     VALUES (", self:escape_literal(key), ", ",
+		       self:escape_literal(owner), ", ",
+		       ttl_escaped, ");"
+  }
+
+  -- TODO：完善
+  local res, err = self:query(sql)
+  if not res then
+    return nil, err
+  end
+
+  --if res[3] and res[3].affected_rows == 1 then
+  --  return true
+  --end
+
+  return true
+end
+
+function _mt:read_lock(key)
+  local sql = concat {
+    "SELECT *\n",
+    "  FROM locks\n",
+    " WHERE `key` = ", self:escape_literal(key), "\n",
+    "   AND `ttl` >= CURRENT_TIMESTAMP\n",
+    " LIMIT 1;"
+  }
+
+  local res, err = self:query(sql)
+  if not res then
+    return nil, err
+  end
+
+  return res[1] ~= nil
+end
+
+function _mt:remove_lock(key, owner)
+  local sql = concat {
+    "DELETE FROM locks\n",
+    "      WHERE `key`   = ", self:escape_literal(key), "\n",
+    "   AND `owner` = ", self:escape_literal(owner), ";"
+  }
+
+  local res, err = self:query(sql)
+  if not res then
+    return nil, err
+  end
+
+  return true
+end
+
+-- TODO:完善
+function _mt:schema_migrations()
+  local conn = self:get_stored_connection()
+  if not conn then
+    error("no connection")
+  end
+
+  -- [COMMENT] check if the table 'schema_meta' exists
+  local has_schema_meta_table
+  for row in self:iterate(SQL_INFORMATION_SCHEMA_TABLES) do
+    local table_name = row.table_name
+    if table_name == "schema_meta" then
+      has_schema_meta_table = true
+      break
+    end
+  end
+
+  if not has_schema_meta_table then
+    -- database, but no schema_meta: needs bootstrap
+    return nil
+  end
+
+  local rows, err = self:query(concat({
+    "SELECT *\n",
+    "  FROM schema_meta\n",
+    " WHERE `key` = ", self:escape_literal("schema_meta"), ";"
+  }))
+
+  if not rows then
+    return nil, err
+  end
+
+  -- TODO executed TEXT[] TEXT not sloved
+  for _, row in ipairs(rows) do
+    if row.pending == null then
+      row.pending = nil
+    else
+      -- [COMMENT] transform string to table
+      row.pending = self:unserialize(row.pending)
+    end
+  end
+
+  -- [COMMENT] transform string to table
+  for _, row in ipairs(rows) do
+    if row.executed ~= nil then
+      row.executed = self:unserialize(row.executed)
+    end
+  end
+
+  -- no migrations: is bootstrapped but not migrated
+  -- migrations: has some migrations
+  return rows
+end
+
+function _mt:schema_bootstrap(kong_config, default_locks_ttl)
+  local conn = self:get_stored_connection()
+  if not conn then
+    error("no connection")
+  end
+
+  -- create schema meta table if not exists
+
+  logger.verbose("creating 'schema_meta' table if not existing...")
+
+  local res, err = self:query([[
+    CREATE TABLE IF NOT EXISTS schema_meta (
+      `key`          varchar(50),
+      `subsystem`    varchar(50),
+      last_executed  TEXT,
+      executed       TEXT,
+      pending        TEXT,
+
+      PRIMARY KEY (`key`, `subsystem`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8;]])
+
+  if not res then
+    return nil, err
+  end
+
+  logger.verbose("successfully created 'schema_meta' table")
+
+  local ok
+  ok, err = self:setup_locks(default_locks_ttl, true)
+  if not ok then
+    return nil, err
+  end
+
+  return true
+end
+
+function _mt:schema_reset()
+  local conn = self:get_stored_connection()
+  if not conn then
+    error("no connection")
+  end
+
+  local user = self:escape_identifier(self.config.user)
+  local ok, err = self:query(concat {
+    "  DROP SCHEMA IF EXISTS public CASCADE;\n",
+    "  CREATE SCHEMA IF NOT EXISTS public AUTHORIZATION ", user, ";\n",
+    "  GRANT ALL ON SCHEMA public TO ", user, ";",
+  })
+
+  if not ok then
+    return nil, err
+  end
+
+  return true
+end
+
+-- [COMMENT] use string(up_sql) to create or upgrade db
+function _mt:run_up_migration(name, up_sql)
+  if type(name) ~= "string" then
+    error("name must be a string", 2)
+  end
+
+  if type(up_sql) ~= "string" then
+    error("up_sql must be a string", 2)
+  end
+
+  local conn = self:get_stored_connection()
+  if not conn then
+    error("no connection")
+  end
+
+  --logger.debug("HHH...run_up_migration...up_sql %s\n", up_sql)
+  local sql = stringx.strip(up_sql)
+  if sub(sql, -1) ~= ";" then
+    sql = sql .. ";"
+  end
+
+  local sql = concat {
+    sql, "\n",
+  }
+
+  --logger.debug("HHH...run_up_migration...sql %s\n", sql)
+  local res, err = self:query(sql)
+  if not res then
+    self:query("ROLLBACK;")
+    return nil, err
+  end
+
+  return true
+end
+
+function _mt:record_migration(subsystem, name, state)
+  if type(subsystem) ~= "string" then
+    error("subsystem must be a string", 2)
+  end
+
+  if type(name) ~= "string" then
+    error("name must be a string", 2)
+  end
+
+  local conn = self:get_stored_connection()
+  if not conn then
+    error("no connection")
+  end
+
+  local key_escaped = self:escape_literal("schema_meta")
+  local subsystem_escaped = self:escape_literal(subsystem)
+  local name_escaped = self:escape_literal(name)
+  -- [COMMENT] cancell record migration because just need base_sql
+  local name_array = self:escape_literal(name)
+
+  local sql
+  if state == "executed" then
+    sql = concat({
+      "INSERT INTO `schema_meta` (`key`, `subsystem`, `last_executed`, `executed`)\n",
+      "     VALUES (", key_escaped, ", ", subsystem_escaped, ", ", name_escaped, ", ", name_array, ");"
+    })
+
+  elseif state == "pending" then
+    sql = concat({
+      "INSERT INTO `schema_meta` (`key`, `subsystem`, `pending`)\n",
+      "     VALUES (", key_escaped, ", ", subsystem_escaped, ", ", name_array, ");"
+    })
+
+  elseif state == "teardown" then
+    sql = concat({
+      "INSERT INTO `schema_meta` (`key`, `subsystem`, `last_executed`, `executed`)\n",
+      "     VALUES (", key_escaped, ", ", subsystem_escaped, ", ", name_escaped, ", ", name_array, ");"
+    })
+
+  else
+    error("unknown 'state' argument: " .. tostring(state))
+  end
+
+  local res, err = self:query(sql)
+  if not res then
+    return nil, err
+  end
+
+  return true
+end
+
+function _mt:are_014_apis_present()
+  local _, err = self:query([[
+    DO $$
+    BEGIN
+      IF EXISTS(SELECT id FROM apis) THEN
+        RAISE EXCEPTION 'there are apis in the db';
+      END IF;
+    EXCEPTION WHEN UNDEFINED_TABLE THEN
+      -- Do nothing, table does not exist
+    END;
+    $$;
+  ]])
+  if err and err:match("there are apis in the db") then
+    return true
+  end
+  if err then
+    return nil, err
+  end
+  return false
+end
+
+function _mt:is_014()
+  local res = {}
+
+  local needed_migrations = {
+    ["core"] = {
+      "2015-01-12-175310_skeleton",
+      "2015-01-12-175310_init_schema",
+      "2015-11-23-817313_nodes",
+      "2016-02-29-142793_ttls",
+      "2016-09-05-212515_retries",
+      "2016-09-16-141423_upstreams",
+      "2016-12-14-172100_move_ssl_certs_to_core",
+      "2016-11-11-151900_new_apis_router_1",
+      "2016-11-11-151900_new_apis_router_2",
+      "2016-11-11-151900_new_apis_router_3",
+      "2016-01-25-103600_unique_custom_id",
+      "2017-01-24-132600_upstream_timeouts",
+      "2017-01-24-132600_upstream_timeouts_2",
+      "2017-03-27-132300_anonymous",
+      "2017-04-18-153000_unique_plugins_id",
+      "2017-04-18-153000_unique_plugins_id_2",
+      "2017-05-19-180200_cluster_events",
+      "2017-05-19-173100_remove_nodes_table",
+      "2017-06-16-283123_ttl_indexes",
+      "2017-07-28-225000_balancer_orderlist_remove",
+      "2017-10-02-173400_apis_created_at_ms_precision",
+      "2017-11-07-192000_upstream_healthchecks",
+      "2017-10-27-134100_consistent_hashing_1",
+      "2017-11-07-192100_upstream_healthchecks_2",
+      "2017-10-27-134100_consistent_hashing_2",
+      "2017-09-14-121200_routes_and_services",
+      "2017-10-25-180700_plugins_routes_and_services",
+      "2018-03-27-123400_prepare_certs_and_snis",
+      "2018-03-27-125400_fill_in_snis_ids",
+      "2018-03-27-130400_make_ids_primary_keys_in_snis",
+      "2018-05-17-173100_hash_on_cookie",
+    },
+    ["response-transformer"] = {
+      "2016-05-04-160000_resp_trans_schema_changes",
+    },
+    ["jwt"] = {
+      "2015-06-09-jwt-auth",
+      "2016-03-07-jwt-alg",
+      "2017-05-22-jwt_secret_not_unique",
+      "2017-07-31-120200_jwt-auth_preflight_default",
+      "2017-10-25-211200_jwt_cookie_names_default",
+      "2018-03-15-150000_jwt_maximum_expiration",
+    },
+    ["ip-restriction"] = {
+      "2016-05-24-remove-cache",
+    },
+    ["statsd"] = {
+      "2017-06-09-160000_statsd_schema_changes",
+    },
+    ["cors"] = {
+      "2017-03-14_multiple_orgins",
+    },
+    ["basic-auth"] = {
+      "2015-08-03-132400_init_basicauth",
+      "2017-01-25-180400_unique_username",
+    },
+    ["key-auth"] = {
+      "2015-07-31-172400_init_keyauth",
+      "2017-07-31-120200_key-auth_preflight_default",
+    },
+    ["ldap-auth"] = {
+      "2017-10-23-150900_header_type_default",
+    },
+    ["hmac-auth"] = {
+      "2015-09-16-132400_init_hmacauth",
+      "2017-06-21-132400_init_hmacauth",
+    },
+    ["datadog"] = {
+      "2017-06-09-160000_datadog_schema_changes",
+    },
+    ["tcp-log"] = {
+      "2017-12-13-120000_tcp-log_tls",
+    },
+    ["acl"] = {
+      "2015-08-25-841841_init_acl",
+    },
+    ["response-ratelimiting"] = {
+      "2015-08-03-132400_init_response_ratelimiting",
+      "2016-08-04-321512_response-rate-limiting_policies",
+      "2017-12-19-120000_add_route_and_service_id_to_response_ratelimiting",
+    },
+    ["request-transformer"] = {
+      "2016-05-04-160000_req_trans_schema_changes",
+    },
+    ["rate-limiting"] = {
+      "2015-08-03-132400_init_ratelimiting",
+      "2016-07-25-471385_ratelimiting_policies",
+      "2017-11-30-120000_add_route_and_service_id",
+    },
+    ["oauth2"] = {
+      "2015-08-03-132400_init_oauth2",
+      "2016-07-15-oauth2_code_credential_id",
+      "2016-12-22-283949_serialize_redirect_uri",
+      "2016-09-19-oauth2_api_id",
+      "2016-12-15-set_global_credentials",
+      "2017-04-24-oauth2_client_secret_not_unique",
+      "2017-10-19-set_auth_header_name_default",
+      "2017-10-11-oauth2_new_refresh_token_ttl_config_value",
+      "2018-01-09-oauth2_pg_add_service_id",
+    },
+  }
+
+  local rows, err = self:query([[
+  select table_name as to_regclass from `information_schema`.TABLES where table_name='schema_migrations';
+  ]])
+  if err then
+    return nil, err
+  end
+
+  if not rows or not rows[1] or rows[1].name ~= "schema_migrations" then
+    -- no trace of legacy migrations: above 0.14
+    return res
+  end
+
+  local schema_migrations_rows, err = self:query([[
+    SELECT "id", "migrations" FROM "schema_migrations";
+  ]])
+  if err then
+    return nil, err
+  end
+
+  if not schema_migrations_rows then
+    -- empty legacy migrations: invalid state
+    res.invalid_state = true
+    return res
+  end
+
+  local schema_migrations = {}
+  for i = 1, #schema_migrations_rows do
+    local row = schema_migrations_rows[i]
+    schema_migrations[row.id] = row.migrations
+  end
+
+  for name, migrations in pairs(needed_migrations) do
+    local current_migrations = schema_migrations[name]
+    if not current_migrations then
+      -- missing all migrations for a component: below 0.14
+      res.invalid_state = true
+      res.missing_component = name
+      return res
+    end
+
+    for _, needed_migration in ipairs(migrations) do
+      local found
+
+      for _, current_migration in ipairs(current_migrations) do
+	if current_migration == needed_migration then
+	  found = true
+	  break
+	end
+      end
+
+      if not found then
+	-- missing at least one migration for a component: below 0.14
+	res.invalid_state = true
+	res.missing_component = name
+	res.missing_migration = needed_migration
+	return res
+      end
+    end
+  end
+
+  -- all migrations match: 0.14 install
+  res.is_014 = true
+
+  return res
+end
+
+
+-- [COMMENT] table to string
+-- return string
+function _mt:serialize(obj)
+  local lua = ""
+  local t = type(obj)
+  if t == "number" then
+    lua = lua .. obj
+  elseif t == "boolean" then
+    lua = lua .. tostring(obj)
+  elseif t == "string" then
+    lua = lua .. string.format("%q", obj)
+  elseif t == "table" then
+    lua = lua .. "{\n"
+    for k, v in pairs(obj) do
+      lua = lua .. "[" .. serialize(k) .. "]=" .. serialize(v) .. ",\n"
+    end
+    local metatable = getmetatable(obj)
+    if metatable ~= nil and type(metatable.__index) == "table" then
+      for k, v in pairs(metatable.__index) do
+	lua = lua .. "[" .. serialize(k) .. "]=" .. serialize(v) .. ",\n"
+      end
+    end
+    lua = lua .. "}"
+  elseif t == "nil" then
+    return nil
+  else
+    error("can not serialize a " .. t .. " type.")
+  end
+  return lua
+end
+
+
+-- [COMMENT] string to table
+-- return table
+function _mt:unserialize(lua)
+  local t = type(lua)
+  local t = type(lua)
+  if t == "nil" or lua == "" then
+    return nil
+  elseif t == "number" or t == "string" or t == "boolean" then
+    lua = tostring(lua)
+  else
+    error("can not unserialize a " .. t .. " type.")
+  end
+  lua = "return " .. lua
+  local func = loadstring(lua)
+  if func == nil then
+    return nil
+  end
+  return func()
+end
+
+local _M = {}
+
+function _M.new(kong_config)
+  local config = {
+    host            = kong_config.mysql_host,
+    port            = kong_config.mysql_port,
+    timeout         = kong_config.mysql_timeout,
+    user            = kong_config.mysql_user,
+    password        = kong_config.mysql_password,
+    database        = kong_config.mysql_database,
+    schema          = kong_config.mysql_schema or "",
+    ssl             = kong_config.mysql_ssl,
+    ssl_verify      = kong_config.mysql_ssl_verify,
+    cafile          = kong_config.lua_ssl_trusted_certificate,
+    sem_max         = kong_config.mysql_max_concurrent_queries or 0,
+    sem_timeout     = (kong_config.mysql_semaphore_timeout or 60000) / 1000,
+    max_packet_size = 1024 * 1024,
+  }
+
+  local db = mysql.new(config)
+
+  local sem
+  if config.sem_max > 0 then
+    local err
+    sem, err = semaphore.new(config.sem_max)
+    if not sem then
+      ngx.log(ngx.CRIT, "failed creating the MySQL connector semaphore: ",
+        err)
+    end
+  end
+
+  return setmetatable({
+    config = config,
+    escape_identifier = db.escape_identifier,
+    escape_literal = db.escape_literal,
+    sem               = sem,
+  }, _mt)
+end
+
+return _M
+
+
+-----------------
+
+kong\db\strategies\mysql\init.lua
+
+local cjson = require "cjson"
+local cjson_safe = require "cjson.safe"
+local kong = kong
+local logger = require "kong.cmd.utils.log"
+
+local encode_base64 = ngx.encode_base64
+local decode_base64 = ngx.decode_base64
+local encode_array = cjson.encode
+local encode_json = cjson.encode
+local setmetatable = setmetatable
+local update_time = ngx.update_time
+local tonumber = tonumber
+local concat = table.concat
+local insert = table.insert
+local ipairs = ipairs
+local pairs = pairs
+local error = error
+local upper = string.upper
+local null = ngx.null
+local load = load
+local find = string.find
+local now = ngx.now
+local fmt = string.format
+local rep = string.rep
+local sub = string.sub
+local max = math.max
+local log = ngx.log
+
+local NOTICE = ngx.NOTICE
+local LIMIT = {}
+local UNIQUE = {}
+
+local new_tab
+local clear_tab
+
+do
+  local pcall = pcall
+  local ok
+
+  ok, new_tab = pcall(require, "table.new")
+  if not ok then
+    new_tab = function()
+      return {}
+    end
+  end
+
+  ok, clear_tab = pcall(require, "table.clear")
+  if not ok then
+    clear_tab = function(tab)
+      for k, _ in pairs(tab) do
+	tab[k] = nil
+      end
+    end
+  end
+end
+
+local function noop(...)
+  return ...
+end
+
+local function now_updated()
+  update_time()
+  return now()
+end
+
+local function compile(name, query)
+  local i, n, p, s, e = 1, 2, 0, find(query, "$1", 1, true)
+  local c = {
+    "local _ = ... or {}\n",
+    "return concat{\n",
+  }
+  while s do
+    if i < s then
+      c[n + 1] = "[=[\n"
+      c[n + 2] = sub(query, i, s - 1)
+      c[n + 3] = "]=], "
+      n = n + 3
+    end
+    p = p + 1
+    c[n + 1] = "_["
+    c[n + 2] = p
+    c[n + 3] = "], "
+    n = n + 3
+    i = e + 1
+    s, e = find(query, "$" .. p + 1, i, true)
+  end
+  s = sub(query, i)
+  if s and s ~= "" then
+    c[n + 1] = "[=[\n"
+    c[n + 2] = s
+    c[n + 3] = "]=]"
+    n = n + 3
+  end
+  c[n + 1] = " }"
+  return load(concat(c), "=" .. name, "t", { concat = concat })
+end
+
+local function expand(name, map)
+  local h = {}
+  local n = 1
+  local c = { "local _ = ... or {}\n" }
+  for _, field in ipairs(map) do
+    local entity = field.entity
+    if not h[entity] then
+      h[entity] = true
+      c[n + 1] = "if "
+      n = n + 1
+      for _, key in ipairs(map) do
+	if entity == key.entity then
+	  c[n + 1] = '_["'
+	  c[n + 2] = field.from
+	  c[n + 3] = '"] ~= null'
+	  c[n + 4] = " and "
+	  n = n + 4
+	end
+      end
+      c[n] = " then\n"
+      c[n + 1] = '  \n  _["'
+      c[n + 2] = entity
+      c[n + 3] = '"] = {\n'
+      n = n + 3
+      for _, key in ipairs(map) do
+	if entity == key.entity then
+	  c[n + 1] = '    ["'
+	  c[n + 2] = field.to
+	  c[n + 3] = '"] = '
+	  c[n + 4] = '_["'
+	  c[n + 5] = field.from
+	  c[n + 6] = '"],\n'
+	  n = n + 6
+	end
+      end
+      c[n + 1] = "  }\n\n"
+      c[n + 2] = "else\n"
+      c[n + 3] = '  _["'
+      c[n + 4] = field.entity
+      c[n + 5] = '"] = null\n'
+      c[n + 6] = "end\n"
+      c[n + 7] = '_["'
+      c[n + 8] = field.from
+      c[n + 9] = '"] = nil\n'
+      n = n + 9
+    end
+  end
+  c[n + 1] = "return _"
+
+  return load(concat(c), "=" .. name, "t", { null = null })
+end
+
+local function collapse(name, map)
+  local h = {}
+  local n = 7
+  local c = {
+    "local t = { ... }\n",
+    "local r = {}\n",
+    "for _, a in ipairs(t) do\n",
+    "  for k, v in pairs(a) do\n",
+    "    r[k] = v\n",
+    "  end\n",
+    "end\n",
+  }
+  for _, field in ipairs(map) do
+    local entity = field.entity
+    if not h[entity] then
+      h[entity] = true
+      c[n + 1] = 'if r["'
+      c[n + 2] = entity
+      c[n + 3] = '"] ~= nil and '
+      c[n + 4] = 'r["'
+      c[n + 5] = entity
+      c[n + 6] = '"] ~= null then\n'
+      n = n + 6
+      for _, key in ipairs(map) do
+	if entity == key.entity then
+	  c[n + 1] = '  r["'
+	  c[n + 2] = field.from
+	  c[n + 3] = '"] = '
+	  c[n + 4] = 'r["'
+	  c[n + 5] = entity
+	  c[n + 6] = '"]["'
+	  c[n + 7] = field.to
+	  c[n + 8] = '"]\n'
+	  n = n + 8
+	end
+      end
+      c[n + 1] = '  r["'
+      c[n + 2] = entity
+      c[n + 3] = '"] = nil\n\n'
+      c[n + 4] = 'elseif r["'
+      c[n + 5] = entity
+      c[n + 6] = '"] == null then\n'
+      n = n + 6
+      for _, key in ipairs(map) do
+	if entity == key.entity then
+	  c[n + 1] = '  r["'
+	  c[n + 2] = field.from
+	  c[n + 3] = '"] = null\n'
+	  n = n + 3
+	end
+      end
+      c[n + 1] = '  r["'
+      c[n + 2] = entity
+      c[n + 3] = '"] = nil\n'
+      c[n + 4] = "end\n"
+      n = n + 4
+    end
+  end
+  c[n + 1] = "return r"
+  local env = { ipairs = ipairs, pairs = pairs, null = null }
+  return load(concat(c), "=" .. name, "t", env)
+end
+
+
+-- [COMMENT] 转义 lua值为数据库标识符，解决冲突的内置SQL关键字
+local function escape_identifier(connector, identifier, field)
+  identifier = '`' .. (tostring(identifier):gsub('"', '""')) .. '`'
+  return identifier
+end
+
+
+-- [COMMENT] 转义 lua值作为查询字符串，防止SQL注入
+local function escape_literal(connector, val, field)
+  local t_val = type(val)
+  if t_val == "nil" then
+    return tostring(val)
+  end
+  if val == null or val == ngx.null then
+    return "NULL"
+  end
+  if field then
+    if field.timestamp then
+      return concat { "FROM_UNIXTIME(", connector:escape_literal(tonumber(fmt("%.3f", val))), ")" }
+    end
+    if t_val == "number" then
+      return tostring(val)
+    elseif t_val == "string" then
+      return "'" .. tostring((val:gsub("'", "''"))) .. "'"
+    elseif t_val == "boolean" then
+      return val and "TRUE" or "FALSE"
+    elseif t_val == "table" then
+      -- [COMMENT] lua table 数据类型转化成字符串
+      if field and (field.type == "record" or field.type == "array" or field.type == "set") then
+	return connector:escape_literal(cjson.encode(val))
+      end
+    end
+  end
+  return connector:escape_literal(val)
+end
+
+local function field_type_to_postgres_type(field)
+  if field.timestamp then
+    return "TIMESTAMP WITH TIME ZONE"
+
+  elseif field.uuid then
+    return "varchar(50)"
+  end
+
+  local t = field.type
+
+  if t == "string" then
+    return "varchar(512)"
+
+  elseif t == "boolean" then
+    return "boolean"
+
+  elseif t == "integer" then
+    return "bigint(20)"
+
+  elseif t == "number" then
+    return "DOUBLE PRECISION"
+
+  elseif t == "array" or t == "set" then
+    local elements = field.elements
+
+    if elements.timestamp then
+      return "TIMESTAMP[] WITH TIME ZONE", 1
+
+    elseif field.uuid then
+      return "UUID[]", 1
+    end
+
+    local et = elements.type
+
+    if et == "string" then
+      return "TEXT[]", 1
+
+    elseif et == "boolean" then
+      return "BOOLEAN[]", 1
+
+    elseif et == "integer" then
+      return "BIGINT[]", 1
+
+    elseif et == "number" then
+      return "DOUBLE PRECISION[]", 1
+
+    elseif et == "array" or et == "set" then
+      local dm = 1
+      local el = elements
+      repeat
+	dm = dm + 1
+	el = el.elements
+	et = el.type
+      until et ~= "array" and et ~= "set"
+
+      local brackets = rep("[]", dm)
+
+      if el.timestamp then
+	return "TIMESTAMP" .. brackets .. " WITH TIME ZONE", dm
+
+      elseif field.uuid then
+	return "UUID" .. brackets, dm
+      end
+
+      if et == "string" then
+	return "TEXT" .. brackets, dm
+
+      elseif et == "boolean" then
+	return "BOOLEAN" .. brackets, dm
+
+      elseif et == "integer" then
+	return "BIGINT" .. brackets, dm
+
+      elseif et == "number" then
+	return "DOUBLE PRECISION" .. brackets, dm
+
+      elseif et == "map" or et == "record" then
+	return "JSONB" .. brackets, dm
+
+      else
+	return "UNKNOWN" .. brackets, dm
+      end
+
+    elseif et == "map" or et == "record" then
+      return "JSONB[]", 1
+
+    else
+      return "UNKNOWN[]", 1
+    end
+
+  elseif t == "map" or t == "record" then
+    return "JSONB"
+
+  else
+    return "UNKNOWN"
+  end
+end
+
+local function toerror(strategy, err, primary_key, entity)
+  local schema = strategy.schema
+  local errors = strategy.errors
+  logger("ERR:", err)
+
+  if find(err, "Duplicate entry", 1, true) then
+    log(NOTICE, err)
+
+    if find(err, "cache_key", 1, true) then
+      local keys = {}
+      for _, k in ipairs(schema.cache_key) do
+	local field = schema.fields[k]
+	if field.type == "foreign" and entity[k] ~= null then
+	  keys[k] = field.schema:extract_pk_values(entity[k])
+	else
+	  keys[k] = entity[k]
+	end
+      end
+      return nil, errors:unique_violation(keys)
+    end
+
+    for field_name, field in schema:each_field() do
+      if field.unique then
+	if find(err, field_name, 1, true) then
+	  return nil, errors:unique_violation({
+	    [field_name] = entity[field_name]
+	  })
+	end
+      end
+    end
+
+    if not primary_key then
+      primary_key = {}
+      if entity then
+	for _, key in ipairs(schema.primary_key) do
+	  primary_key[key] = entity[key]
+	end
+      end
+    end
+    return nil, errors:primary_key_violation(primary_key)
+
+  elseif find(err, "violates not-null constraint", 1, true) then
+    -- not-null constraint is currently only enforced on primary key
+    log(NOTICE, err)
+    if not primary_key then
+      primary_key = {}
+      if entity then
+	for _, key in ipairs(schema.primary_key) do
+	  primary_key[key] = entity[key]
+	end
+      end
+    end
+    return nil, errors:primary_key_violation(primary_key)
+
+  elseif find(err, "violates foreign key constraint", 1, true) then
+    log(NOTICE, err)
+    if find(err, "is not present in table", 1, true) then
+      local foreign_field_name
+      local foreign_schema
+      for field_name, field in schema:each_field() do
+	if field.type == "foreign" then
+	  local escaped_identifier = escape_identifier(strategy.connector,
+		  field.schema.name)
+
+	  if find(err, escaped_identifier, 1, true) then
+	    foreign_field_name = field_name
+	    foreign_schema = field.schema
+	    break
+	  end
+	end
+      end
+
+      if not foreign_schema then
+	return error("could not determine foreign schema for violated foreign key error")
+      end
+
+      local foreign_key = {}
+      for _, key in ipairs(foreign_schema.primary_key) do
+	foreign_key[key] = entity[foreign_field_name][key]
+      end
+
+      return nil, errors:foreign_key_violation_invalid_reference(foreign_key,
+	      foreign_field_name,
+	      foreign_schema.name)
+
+    else
+      local found, e = find(err, "is still referenced from table", 1, true)
+      if not found then
+	return error("could not parse foreign key violation error message: " .. err)
+      end
+
+      return nil, errors:foreign_key_violation_restricted(schema.name, sub(err, e + 3, -3))
+    end
+  end
+
+  return nil, errors:database_error(err)
+end
+
+local function execute(strategy, statement_name, attributes, options)
+  local connector = strategy.connector
+  local statement = strategy.statements[statement_name]
+  if not attributes then
+    return connector:query(statement)
+  end
+
+  local fields = strategy.fields
+  local argn = statement.argn
+  local argv = statement.argv
+  local argc = statement.argc
+
+  clear_tab(argv)
+
+  local is_update = options and options.update
+  local has_ttl = strategy.schema.ttl
+  local ttl_value
+
+  if has_ttl then
+    ttl_value = options and options.ttl
+    if ttl_value then
+      if ttl_value == 0 then
+	ttl_value = escape_literal(connector, null, fields.ttl)
+
+      elseif not is_update and
+	      attributes.created_at and
+	      fields.created_at and
+	      fields.created_at.timestamp and
+	      fields.created_at.auto then
+	ttl_value = escape_literal(connector, ttl_value + attributes.created_at, fields.ttl)
+
+      elseif is_update and
+	      attributes.updated_at and
+	      fields.updated_at and
+	      fields.updated_at.timestamp and
+	      fields.updated_at.auto then
+	ttl_value = escape_literal(connector, ttl_value + attributes.updated_at, fields.ttl)
+
+      else
+	ttl_value = escape_literal(connector, ttl_value + now_updated(), fields.ttl)
+      end
+
+    else
+      if is_update then
+	ttl_value = escape_identifier(connector, "ttl")
+      else
+	ttl_value = escape_literal(connector, null, fields.ttl)
+      end
+    end
+  end
+
+  for i = 1, argc do
+    local name = argn[i]
+    local value
+    if has_ttl and name == "ttl" then
+      argv[i] = ttl_value
+
+    else
+      if i == argc and is_update and attributes[UNIQUE] then
+	value = attributes[UNIQUE]
+
+      else
+	value = attributes[name]
+      end
+
+      if value == nil and is_update then
+	argv[i] = escape_identifier(connector, name)
+      else
+	argv[i] = escape_literal(connector, value, fields[name])
+      end
+    end
+  end
+
+  local sql = statement.make(argv)
+  local result, err = connector:query(sql)
+  return result, err
+end
+
+local function page(self, size, token, foreign_key, foreign_entity_name, options)
+  local limit = size + 1
+
+  local statement_name
+  local attributes
+
+  if token then
+    if foreign_entity_name then
+      statement_name = concat({ "page_for", foreign_entity_name, "next" }, "_")
+      attributes = {
+	[foreign_entity_name] = foreign_key,
+	[LIMIT] = limit,
+      }
+
+    elseif options and options.tags then
+      statement_name = options.tags_cond == "or" and
+        "page_by_tags_or_next" or
+        "page_by_tags_and_next"
+      attributes     = {
+        tags    = options.tags,
+        [LIMIT] = limit,
+      }
+    else
+      statement_name = "page_next"
+      attributes = {
+	[LIMIT] = limit,
+      }
+    end
+
+    local token_decoded = decode_base64(token)
+    if not token_decoded then
+      return nil, self.errors:invalid_offset(token, "bad base64 encoding")
+    end
+
+    token_decoded = cjson_safe.decode(token_decoded)
+    if not token_decoded then
+      return nil, self.errors:invalid_offset(token, "bad json encoding")
+    end
+
+    for i, field_name in ipairs(self.schema.primary_key) do
+      attributes[field_name] = token_decoded[i]
+    end
+
+  else
+    if foreign_entity_name then
+      statement_name = concat({ "page_for", foreign_entity_name, "first" }, "_")
+      attributes = {
+	[foreign_entity_name] = foreign_key,
+	[LIMIT] = limit,
+      }
+
+    elseif options and options.tags then
+      statement_name = options.tags_cond == "or" and
+        "page_by_tags_or_first" or
+        "page_by_tags_and_first"
+      attributes     = {
+        tags    = options.tags,
+        [LIMIT] = limit,
+      }
+    else
+      statement_name = "page_first"
+      attributes = {
+	[LIMIT] = limit,
+      }
+    end
+  end
+
+  local res, err = execute(self, statement_name, self.collapse(attributes), options)
+
+  if not res then
+    return toerror(self, err)
+  end
+
+  local rows = new_tab(size, 0)
+
+  for i = 1, limit do
+    local row = res[i]
+    if not row then
+      break
+    end
+
+    if i == limit then
+      row = res[size]
+      local offset = {}
+      for i, field_name in ipairs(self.schema.primary_key) do
+	offset[i] = row[field_name]
+      end
+
+      offset = cjson.encode(offset)
+      offset = encode_base64(offset, true)
+
+      return rows, nil, offset
+    end
+
+    rows[i] = self.expand(row)
+  end
+
+  return rows
+end
+
+local function make_select_for(foreign_entity_name)
+  return function(self, foreign_key, size, token, options)
+    return page(self, size, token, foreign_key, foreign_entity_name, options)
+  end
+end
+
+local _mt = {}
+
+_mt.__index = _mt
+
+function _mt:create(options)
+  local res, err = execute(self, "create", nil, options)
+  if not res then
+    return toerror(self, err)
+  end
+  return true, nil
+end
+
+function _mt:truncate(options)
+  local res, err = execute(self, "truncate", nil, options)
+  if not res then
+    return toerror(self, err)
+  end
+  return true, nil
+end
+
+
+function _mt:drop(options)
+  local res, err = execute(self, "drop", nil, options)
+  if not res then
+    return toerror(self, err)
+  end
+  return true, nil
+end
+
+-- TODO:需要重新看看
+function _mt:insert(entity, options)
+  local res, err = execute(self, "insert", self.collapse(entity), options)
+  logger("INSERT ENTITY:", encode_json(entity))
+  if res then
+
+    logger("INSERT RES:", res)
+    return self.expand(entity), nil
+    --local resRet, errRet = execute(self, "select", self.collapse(entity), options)
+    --if resRet then
+    --  local row = resRet[1]
+    --  if row then
+    --logger("SELECT ROW:", encode_json(row))
+    --return self.expand(row), nil
+    --  end
+    --end
+    --return nil, nil
+  end
+
+  return toerror(self, err, nil, entity)
+end
+
+
+function _mt:select(primary_key, options)
+  local res, err = execute(self, "select", self.collapse(primary_key), options)
+  if res then
+    local row = res[1]
+    if row then
+      return self.expand(row), nil
+    end
+
+    return nil, nil
+  end
+
+  return toerror(self, err, primary_key)
+end
+
+function _mt:select_by_field(field_name, unique_value, options)
+  local statement_name = "select_by_" .. field_name
+  local filter = {
+    [field_name] = unique_value,
+  }
+
+  local res, err = execute(self, statement_name, self.collapse(filter), options)
+  if res then
+    local row = res[1]
+    if row then
+      return self.expand(row), nil
+    end
+
+    return nil, nil
+  end
+
+  return toerror(self, err, filter)
+end
+
+function _mt:update(primary_key, entity, options)
+  local res, err = execute(self, "update", self.collapse(primary_key, entity), {
+    update = true,
+    ttl = options and options.ttl,
+  })
+  -- TODO:处理逻辑不一样，是否需要重新考虑
+  if res then
+    local resRet, errRet = execute(self, "select", self.collapse(primary_key, entity))
+    if resRet then
+      local row = resRet[1]
+      if row then
+	      return self.expand(row), nil
+      end
+    end
+    return nil, self.errors:not_found(primary_key)
+  end
+
+  return toerror(self, err, primary_key, entity)
+end
+
+function _mt:update_by_field(field_name, unique_value, entity, options)
+  local res, err = execute(self, "update_by_" .. field_name, self.collapse({ [UNIQUE] = unique_value }, entity), {
+    update = true,
+    ttl = options and options.ttl,
+  })
+  -- TODO:处理逻辑不一样，是否需要重新考虑
+  if res then
+    return self:select_by_field(field_name, unique_value, options)
+  end
+
+  return toerror(self, err, { [field_name] = unique_value }, entity)
+end
+
+function _mt:upsert(primary_key, entity, options)
+  local collapsed_entity = self.collapse(entity, primary_key)
+  local res, err = execute(self, "upsert", collapsed_entity, options)
+  if res then
+    -- TODO:处理逻辑不一样，是否需要重新考虑
+    local resRet, errRet = execute(self, "select", self.collapse(primary_key))
+    if resRet then
+      local row = resRet[1]
+      if row then
+	return self.expand(row), nil
+      end
+    end
+    return nil, self.errors:not_found(primary_key)
+  end
+
+  return toerror(self, err, primary_key, entity)
+end
+
+function _mt:upsert_by_field(field_name, unique_value, entity, options)
+  local collapsed_entity = self.collapse(entity, {
+    [field_name] = unique_value
+  })
+  local res, err = execute(self, "upsert_by_" .. field_name, collapsed_entity, options)
+  if res then
+    -- TODO:处理逻辑不一样，是否需要重新考虑
+    return self:select_by_field(field_name, unique_value, options)
+  end
+
+  return toerror(self, err, { [field_name] = unique_value }, entity)
+end
+
+function _mt:delete(primary_key, options)
+  local res, err = execute(self, "delete", self.collapse(primary_key), options)
+  if res then
+    if res.affected_rows == 0 then
+      return nil, nil
+    end
+
+    return true, nil
+  end
+
+  return toerror(self, err, primary_key)
+end
+
+function _mt:delete_by_field(field_name, unique_value, options)
+  local statement_name = "delete_by_" .. field_name
+  local filter = {
+    [field_name] = unique_value,
+  }
+
+  local res, err = execute(self, statement_name, self.collapse(filter), options)
+
+  if res then
+    if res.affected_rows == 0 then
+      return nil, nil
+    end
+
+    return true, nil
+  end
+
+  return toerror(self, err, filter)
+end
+
+function _mt:count(options)
+  local res, err = execute(self, "count", nil, options)
+  if res then
+    local row = res[1]
+    if row then
+      return row.count, nil
+
+    else
+      -- count should always return results unless there is an error
+      return toerror(self, "unexpected")
+    end
+  end
+
+  return toerror(self, err)
+end
+
+function _mt:page(size, token, options)
+  return page(self, size, token, nil, nil, options)
+end
+
+function _mt:escape_literal(literal, field_name)
+  return escape_literal(self.connector, literal, self.fields[field_name])
+end
+
+-- TODO：kong 1.3 变化了
+
+--local _M = {
+--  CUSTOM_STRATEGIES = {
+--    plugins = require("kong.db.strategies.mysql.plugins"),
+--  }
+--}
+
+local _M  = {}
+
+function _M.new(connector, schema, errors)
+  local primary_key = schema.primary_key
+  local primary_key_fields = {}
+  local primary_key_count = 0
+
+  for i, field_name in ipairs(primary_key) do
+    primary_key_fields[field_name] = true
+    primary_key_count = i
+  end
+
+  local ttl = schema.ttl == true
+  local tags                          = schema.fields.tags ~= nil
+  local composite_cache_key = schema.cache_key and #schema.cache_key > 1
+  local max_name_length = ttl and 3 or 1
+  local max_type_length = ttl and 24 or 1
+  local fields = {}
+  local fields_count = 0
+  local fields_hash = {}
+
+  local table_name = schema.name
+  local table_name_escaped = escape_identifier(connector, table_name)
+
+  local foreign_key_constraints = {}
+  local foreign_key_constrainst_count = 0
+  local foreign_key_indexes_escaped = {}
+  local foreign_key_indexes = {}
+  local foreign_key_count = 0
+  local foreign_key_list = {}
+  local foreign_keys = {}
+
+  local unique_fields_count = 0
+  local unique_fields = {}
+
+  for field_name, field in schema:each_field() do
+    if field.type == "foreign" then
+      local foreign_schema = field.schema
+      local foreign_key_names = {}
+      local foreign_key_escaped = {}
+      local foreign_col_names = {}
+      local foreign_pk_count = #foreign_schema.primary_key
+      local is_part_of_composite_key = foreign_pk_count > 1
+
+      local on_delete = field.on_delete
+      if on_delete then
+        on_delete = upper(on_delete)
+        if on_delete ~= "RESTRICT" and
+          on_delete ~= "CASCADE" and
+          on_delete ~= "NULL" and
+          on_delete ~= "DEFAULT" then
+          on_delete = nil
+        end
+      end
+
+      local on_update = field.on_update
+      if on_update then
+        on_update = upper(on_update)
+        if on_update ~= "RESTRICT" and
+          on_update ~= "CASCADE" and
+          on_update ~= "NULL" and
+          on_update ~= "DEFAULT" then
+          on_update = nil
+        end
+      end
+
+      for i, foreign_field_name in ipairs(foreign_schema.primary_key) do
+	local foreign_field
+	for foreign_schema_field_name, foreign_schema_field in foreign_schema:each_field() do
+	  if foreign_schema_field_name == foreign_field_name then
+	    foreign_field = foreign_schema_field
+	    break
+	  end
+	end
+
+	local name = concat({ field_name, foreign_field_name }, "_")
+
+	fields_hash[name] = foreign_field
+
+	local name_escaped = escape_identifier(connector, name)
+	local name_expression = escape_identifier(connector, name, foreign_field)
+	local type_postgres = field_type_to_postgres_type(foreign_field)
+	local is_used_in_primary_key = primary_key_fields[name] ~= nil
+	local is_unique = foreign_field.unique == true
+	local is_endpoint_key = schema.endpoint_key == field_name
+
+	max_name_length = max(max_name_length, #name_escaped)
+	max_type_length = max(max_type_length, #type_postgres)
+
+	local prepared_field = {
+	  referenced_table = foreign_schema.name,
+	  referenced_column = foreign_field_name,
+	  on_update = on_update,
+	  on_delete = on_delete,
+	  name = name,
+	  name_escaped = name_escaped,
+	  name_expression = name_expression,
+	  type_postgres = type_postgres,
+	  is_used_in_primary_key = is_used_in_primary_key,
+	  is_part_of_composite_key = is_part_of_composite_key,
+	  is_unique = is_unique,
+	  is_endpoint_key = is_endpoint_key,
+	}
+
+	if prepared_field.is_used_in_primary_key then
+	  primary_key_fields[field_name] = prepared_field
+	end
+
+	fields_count = fields_count + 1
+	fields[fields_count] = prepared_field
+
+	foreign_key_names[i] = name
+	foreign_key_escaped[i] = name_escaped
+	foreign_col_names[i] = escape_identifier(connector, foreign_field_name)
+	insert(foreign_key_list, {
+	  from = name,
+	  entity = field_name,
+	  to = foreign_field_name
+	})
+      end
+
+      foreign_keys[field_name] = {
+        names = foreign_key_names,
+        escaped = foreign_key_escaped,
+        count = foreign_pk_count,
+      }
+
+      local foreign_key_index_name = concat({ table_name, field_name }, "_fkey_")
+      local foreign_key_index_identifier = escape_identifier(connector, foreign_key_index_name)
+
+      foreign_key_count = foreign_key_count + 1
+      foreign_key_indexes_escaped[foreign_key_count] = foreign_key_index_identifier
+
+      foreign_key_indexes[foreign_key_count] = concat {
+	"CREATE INDEX IF NOT EXISTS ", foreign_key_index_identifier, " ON ", table_name_escaped, " (", concat(foreign_key_escaped, ", "), ");",
+      }
+
+      if is_part_of_composite_key then
+        foreign_key_constrainst_count = foreign_key_constrainst_count + 1
+        if on_delete and on_update then
+          foreign_key_constraints[foreign_key_constrainst_count] = concat {
+            "  FOREIGN KEY (", concat(foreign_key_names, ", "), ")\n",
+            "   REFERENCES ", escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")\n",
+            "    ON DELETE ", on_delete, "\n",
+            "    ON UPDATE ", on_update,
+          }
+
+        elseif on_delete then
+          foreign_key_constraints[foreign_key_constrainst_count] = concat {
+            "  FOREIGN KEY (", concat(foreign_key_names, ", "), ")\n",
+            "   REFERENCES ", escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")\n",
+            "    ON DELETE ", on_delete,
+          }
+
+        elseif on_update then
+          foreign_key_constraints[foreign_key_constrainst_count] = concat {
+            "  FOREIGN KEY (", concat(foreign_key_names, ", "), ")\n",
+            "   REFERENCES ", escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")\n",
+            "    ON UPDATE ", on_update,
+          }
+
+        else
+          foreign_key_constraints[foreign_key_constrainst_count] = concat {
+            "  FOREIGN KEY (", concat(foreign_key_names, ", "), ")\n",
+            "   REFERENCES ", escape_identifier(connector, foreign_schema.name), " (", concat(foreign_col_names, ", "), ")",
+          }
+        end
+      end
+
+    else
+      fields_hash[field_name] = field
+
+      local name_escaped = escape_identifier(connector, field_name)
+      local name_expression = escape_identifier(connector, field_name, field)
+      local type_postgres = field_type_to_postgres_type(field)
+      local is_used_in_primary_key = primary_key_fields[field_name] ~= nil
+      local is_part_of_composite_key = is_used_in_primary_key and primary_key_count > 1 or false
+      local is_unique = field.unique == true
+      local is_endpoint_key = schema.endpoint_key == field_name
+
+      max_name_length = max(max_name_length, #name_escaped)
+      max_type_length = max(max_type_length, #type_postgres)
+
+      local prepared_field = {
+        name = field_name,
+        name_escaped = name_escaped,
+        name_expression = name_expression,
+        type_postgres = type_postgres,
+        is_used_in_primary_key = is_used_in_primary_key,
+        is_part_of_composite_key = is_part_of_composite_key,
+        is_unique = is_unique,
+        is_endpoint_key = is_endpoint_key,
+      }
+
+      if prepared_field.is_used_in_primary_key then
+	      primary_key_fields[field_name] = prepared_field
+      end
+
+      fields_count = fields_count + 1
+      fields[fields_count] = prepared_field
+    end
+  end
+
+  local primary_key_names = {}
+  local primary_key_placeholders = {}
+  local insert_names = {}
+  local insert_columns = {}
+  local insert_expressions = {}
+  local select_expressions = {}
+  local update_expressions = {}
+  local update_names = {}
+  local update_placeholders = {}
+  local update_fields_count = 0
+  local upsert_expressions = {}
+  local create_expressions = {}
+  local page_next_names = {}
+  local page_next_count = primary_key_count + 1
+
+  for i = 1, fields_count do
+    local name = fields[i].name
+    local name_escaped = fields[i].name_escaped
+    local name_expression = fields[i].name_expression
+    local type_postgres = fields[i].type_postgres
+    local is_used_in_primary_key = fields[i].is_used_in_primary_key
+    local is_part_of_composite_key = fields[i].is_part_of_composite_key
+    local is_unique = fields[i].is_unique
+    local is_endpoint_key = fields[i].is_endpoint_key
+    local referenced_table = fields[i].referenced_table
+    local referenced_column = fields[i].referenced_column
+    local on_delete = fields[i].on_delete
+    local on_update = fields[i].on_update
+
+    insert_names[i] = name
+    insert_columns[i] = name_escaped
+    insert_expressions[i] = "$" .. i
+    select_expressions[i] = name_expression
+
+    if not is_used_in_primary_key then
+      update_fields_count = update_fields_count + 1
+      update_names[update_fields_count] = name
+      update_expressions[update_fields_count] = name_escaped .. " = $" .. update_fields_count
+      upsert_expressions[update_fields_count] = name_escaped .. " = " .. "EXCLUDED." .. name_escaped
+    end
+
+    local create_expression = {}
+
+    create_expression[1] = name_escaped
+    create_expression[2] = rep(" ", max_name_length - #name_escaped + 2)
+
+    create_expression[3] = type_postgres
+
+    if is_used_in_primary_key and not is_part_of_composite_key then
+      create_expression[4] = rep(" ", max_type_length - #type_postgres + (#type_postgres < max_name_length and 3 or 2))
+      create_expression[5] = "PRIMARY KEY"
+
+      if referenced_table then
+        create_expression[6] = "  REFERENCES "
+        create_expression[7] = escape_identifier(connector, referenced_table)
+        create_expression[8] = " ("
+        create_expression[9] = escape_identifier(connector, referenced_column)
+        create_expression[10] = ")"
+
+        if on_delete and on_update then
+          create_expression[11] = " ON DELETE "
+          create_expression[12] = on_delete
+          create_expression[13] = " ON UPDATE "
+          create_expression[14] = on_update
+
+        elseif on_delete then
+          create_expression[11] = " ON DELETE "
+          create_expression[12] = on_delete
+
+        elseif on_update then
+          create_expression[11] = " ON UPDATE "
+          create_expression[12] = on_update
+        end
+      end
+
+    elseif referenced_table and not is_part_of_composite_key then
+      create_expression[4] = rep(" ", max_type_length - #type_postgres + (#type_postgres < max_name_length and 3 or 2))
+      create_expression[5] = "REFERENCES "
+      create_expression[6] = escape_identifier(connector, referenced_table)
+      create_expression[7] = " ("
+      create_expression[8] = escape_identifier(connector, referenced_column)
+      create_expression[9] = ")"
+
+      if on_delete and on_update then
+        create_expression[10] = " ON DELETE "
+        create_expression[11] = on_delete
+        create_expression[12] = " ON UPDATE "
+        create_expression[13] = on_update
+
+      elseif on_delete then
+        create_expression[10] = " ON DELETE "
+        create_expression[11] = on_delete
+
+      elseif on_update then
+        create_expression[10] = " ON UPDATE "
+        create_expression[11] = on_update
+      end
+
+    elseif is_unique then
+      if not is_used_in_primary_key and not referenced_table then
+        create_expression[4] = rep(" ", max_type_length - #type_postgres + (#type_postgres < max_name_length and 3 or 2))
+        create_expression[5] = "UNIQUE"
+      end
+
+      unique_fields_count = unique_fields_count + 1
+      unique_fields[unique_fields_count] = fields[i]
+
+    elseif is_endpoint_key and not is_unique then
+      -- treat it like a unique key anyway - they are indexed (example: target.target)
+      unique_fields_count = unique_fields_count + 1
+      unique_fields[unique_fields_count] = fields[i]
+    end
+
+    create_expressions[i] = concat(create_expression)
+  end
+
+  local update_args_names = {}
+
+  for i = 1, update_fields_count do
+    update_args_names[i] = update_names[i]
+  end
+
+  local create_count = fields_count
+
+  local cache_key_escaped
+  local cache_key_index
+  if composite_cache_key then
+    cache_key_escaped = escape_identifier(connector, "cache_key")
+    cache_key_index = escape_identifier(connector, table_name .. "_" .. "cache_key_idx")
+    update_fields_count = update_fields_count + 1
+    update_names[update_fields_count] = "cache_key"
+    update_args_names[update_fields_count] = "cache_key"
+    update_expressions[update_fields_count] = cache_key_escaped .. " = $" .. update_fields_count
+    upsert_expressions[update_fields_count] = cache_key_escaped .. " = " .. "EXCLUDED." .. cache_key_escaped
+
+    local create_expression = {
+      cache_key_escaped,
+      rep(" ", max_name_length - #cache_key_escaped + 2),
+      field_type_to_postgres_type({ type = "string" }),
+    }
+
+    create_count = create_count + 1
+    create_expressions[create_count] = concat(create_expression)
+  end
+
+  local ttl_escaped
+  local ttl_index
+  if ttl then
+    ttl_escaped = escape_identifier(connector, "ttl")
+    ttl_index = escape_identifier(connector, table_name .. "_" .. "ttl_idx")
+    update_fields_count = update_fields_count + 1
+    update_names[update_fields_count] = "ttl"
+    update_args_names[update_fields_count] = "ttl"
+    update_expressions[update_fields_count] = ttl_escaped .. " = $" .. update_fields_count
+    upsert_expressions[update_fields_count] = ttl_escaped .. " = " .. "EXCLUDED." .. ttl_escaped
+
+    local create_expression = {
+      ttl_escaped,
+      rep(" ", max_name_length - #ttl_escaped + 2),
+      field_type_to_postgres_type({ timestamp = true }),
+    }
+
+    create_count = create_count + 1
+    create_expressions[create_count] = concat(create_expression)
+  end
+
+  local update_args_count = update_fields_count
+  local primary_key_escaped = {}
+  for i = 1, primary_key_count do
+    local primary_key_field = primary_key_fields[primary_key[i]]
+    primary_key_names[i] = primary_key_field.name
+    primary_key_escaped[i] = primary_key_field.name_escaped
+    update_args_count = update_args_count + 1
+    update_args_names[update_args_count] = primary_key_field.name
+    update_placeholders[i] = "$" .. update_args_count
+    primary_key_placeholders[i] = "$" .. i
+    page_next_names[i] = primary_key[i]
+  end
+
+  page_next_names[page_next_count] = LIMIT
+
+  local pk_escaped = concat(primary_key_escaped, ", ")
+  if primary_key_count > 1 then
+    create_count = create_count + 1
+    create_expressions[create_count] = concat {
+      "PRIMARY KEY (", pk_escaped, ")"
+    }
+  end
+
+  for i = 1, foreign_key_constrainst_count do
+    create_count = create_count + 1
+    create_expressions[create_count] = foreign_key_constraints[i]
+  end
+
+  select_expressions = concat(select_expressions, ", ")
+  primary_key_placeholders = concat(primary_key_placeholders, ", ")
+  update_placeholders = concat(update_placeholders, ", ")
+
+  local create_statement
+  local insert_count
+  local insert_statement
+  local upsert_statement
+  local select_statement
+  local page_first_statement
+  local page_next_statement
+  local update_statement
+  local delete_statement
+  local count_statement
+  local drop_statement
+
+  if composite_cache_key then
+    fields_hash.cache_key = { type = "string" }
+
+    insert_count = fields_count + 1
+    insert_names[insert_count] = "cache_key"
+    insert_expressions[insert_count] = "$" .. insert_count
+    insert_columns[insert_count] = cache_key_escaped
+    fields_count = fields_count + 1
+  end
+
+  if ttl then
+    fields_hash.ttl = { timestamp = true }
+
+    insert_count = fields_count + 1
+    insert_names[insert_count] = "ttl"
+    insert_expressions[insert_count] = "$" .. insert_count
+    insert_columns[insert_count] = ttl_escaped
+
+    insert_expressions = concat(insert_expressions, ", ")
+    insert_columns = concat(insert_columns, ", ")
+
+    update_expressions = concat(update_expressions, ", ")
+
+    upsert_expressions = concat(upsert_expressions, ", ")
+
+    create_statement = concat {
+      "CREATE TABLE IF NOT EXISTS ", table_name_escaped, " (\n",
+      "  ", concat(create_expressions, ",\n  "), "\n",
+      ");\n", concat(foreign_key_indexes, "\n"), "\n",
+      "CREATE INDEX IF NOT EXISTS ", ttl_index, " ON ", table_name_escaped, " (", ttl_escaped, ");",
+    }
+
+    insert_statement = concat {
+      "REPLACE INTO ", table_name_escaped, " (", insert_columns, ")\n",
+      "     VALUES (", insert_expressions, ");",
+    }
+
+    upsert_statement = concat {
+      "REPLACE INTO ", table_name_escaped, " (", insert_columns, ")\n",
+      "     VALUES (", insert_expressions, ");",
+    }
+
+    update_statement = concat {
+      "   UPDATE ", table_name_escaped, "\n",
+      "      SET ", update_expressions, "\n",
+      "    WHERE (", pk_escaped, ") = (", update_placeholders, ")\n",
+      "      AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP);",
+      --"      AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+      --"RETURNING ",  select_expressions , ";"
+    }
+
+    select_statement = concat {
+      "SELECT ", select_expressions, "\n",
+      "  FROM ", table_name_escaped, "\n",
+      " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ")\n",
+      "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP)\n",
+      " LIMIT 1;"
+    }
+
+    page_first_statement = concat {
+      "  SELECT ", select_expressions, "\n",
+      "    FROM ", table_name_escaped, "\n",
+      "   WHERE (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP)\n",
+      "ORDER BY ", pk_escaped, "\n",
+      "   LIMIT $1;";
+    }
+
+    page_next_statement = concat {
+      "  SELECT ", select_expressions, "\n",
+      "    FROM ", table_name_escaped, "\n",
+      "   WHERE (", pk_escaped, ") > (", primary_key_placeholders, ")\n",
+      "     AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP)\n",
+      "ORDER BY ", pk_escaped, "\n",
+      "   LIMIT $", page_next_count, ";"
+    }
+
+    delete_statement = concat {
+      "DELETE\n",
+      "  FROM ", table_name_escaped, "\n",
+      " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ")\n",
+      "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP);",
+    }
+
+    count_statement = concat {
+      "SELECT COUNT(*) AS ", escape_identifier(connector, "count"), "\n",
+      "  FROM ", table_name_escaped, "\n",
+      " WHERE (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP)\n",
+      " LIMIT 1;"
+    }
+
+    if foreign_key_count > 0 then
+      drop_statement = concat {
+	"DROP INDEX IF EXISTS ", ttl_index, ", ", concat(foreign_key_indexes_escaped, ", "), ";\n",
+	"DROP TABLE IF EXISTS ", table_name_escaped, ";"
+      }
+
+    else
+      drop_statement = concat {
+	"DROP INDEX IF EXISTS ", ttl_index, ";\n",
+	"DROP TABLE IF EXISTS ", table_name_escaped, ";"
+      }
+    end
+
+  else
+    insert_count = fields_count
+
+    insert_expressions = concat(insert_expressions, ", ")
+    insert_columns = concat(insert_columns, ", ")
+
+    update_expressions = concat(update_expressions, ", ")
+
+    upsert_expressions = concat(upsert_expressions, ", ")
+
+    create_statement = concat {
+      "CREATE TABLE IF NOT EXISTS ", table_name_escaped, " (\n",
+      "  ", concat(create_expressions, ",\n  "), "\n",
+      ");\n", concat(foreign_key_indexes, "\n")
+    }
+
+    insert_statement = concat {
+      "REPLACE INTO ", table_name_escaped, " (", insert_columns, ")\n",
+      "     VALUES (", insert_expressions, ");",
+      --"     VALUES (", insert_expressions, ")\n",
+      --"  RETURNING ",  select_expressions, ";",
+    }
+
+    upsert_statement = concat {
+      "REPLACE INTO ", table_name_escaped, " (", insert_columns, ")\n",
+      "     VALUES (", insert_expressions, ");",
+    }
+
+    update_statement = concat {
+      "   UPDATE ", table_name_escaped, "\n",
+      "      SET ", update_expressions, "\n",
+      "    WHERE (", pk_escaped, ") = (", update_placeholders, ");",
+      --"    WHERE (", pk_escaped, ") = (", update_placeholders, ")\n",
+      --"RETURNING ",  select_expressions , ";"
+    }
+
+    select_statement = concat {
+      "SELECT ", select_expressions, "\n",
+      "  FROM ", table_name_escaped, "\n",
+      " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ")\n",
+      " LIMIT 1;"
+    }
+
+    page_first_statement = concat {
+      "  SELECT ", select_expressions, "\n",
+      "    FROM ", table_name_escaped, "\n",
+      "ORDER BY ", pk_escaped, "\n",
+      "   LIMIT $1;";
+    }
+
+    page_next_statement = concat {
+      "  SELECT ", select_expressions, "\n",
+      "    FROM ", table_name_escaped, "\n",
+      "   WHERE (", pk_escaped, ") > (", primary_key_placeholders, ")\n",
+      "ORDER BY ", pk_escaped, "\n",
+      "   LIMIT $", page_next_count, ";"
+    }
+
+    delete_statement = concat {
+      "DELETE\n",
+      "  FROM ", table_name_escaped, "\n",
+      " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ");",
+    }
+
+    count_statement = concat {
+      "SELECT COUNT(*) AS ", escape_identifier(connector, "count"), "\n",
+      "  FROM ", table_name_escaped, "\n",
+      " LIMIT 1;"
+    }
+
+    if foreign_key_count > 0 then
+      drop_statement = concat {
+        "DROP INDEX IF EXISTS ", concat(foreign_key_indexes_escaped, ", "), ";\n",
+        "DROP TABLE IF EXISTS ", table_name_escaped, " CASCADE;"
+      }
+
+    else
+      drop_statement = concat {
+	      "DROP TABLE IF EXISTS ", table_name_escaped, " CASCADE;"
+      }
+    end
+  end
+
+  if composite_cache_key then
+    create_statement = concat { create_statement,
+				"CREATE INDEX IF NOT EXISTS ", cache_key_index,
+				" ON ", table_name_escaped, " (", cache_key_escaped, ");"
+    }
+  end
+
+  local truncate_statement = concat {
+    "TRUNCATE ", table_name_escaped, " RESTART IDENTITY CASCADE;"
+  }
+
+  local primary_key_args = new_tab(primary_key_count, 0)
+  local insert_args = new_tab(insert_count, 0)
+  local update_args = new_tab(update_args_count, 0)
+  local single_args = new_tab(1, 0)
+  local page_next_args = new_tab(page_next_count, 0)
+
+  local self = setmetatable({
+    connector = connector,
+    schema = schema,
+    errors = errors,
+    expand = foreign_key_count > 0 and
+             expand(table_name .. "_expand", foreign_key_list) or
+             noop,
+    collapse = collapse(table_name .. "_collapse", foreign_key_list),
+    fields = fields_hash,
+    statements = {
+      create = create_statement,
+      truncate = truncate_statement,
+      count = count_statement,
+      drop = drop_statement,
+      insert = {
+        expr = insert_expressions,
+        cols = insert_columns,
+        argn = insert_names,
+        argc = insert_count,
+        argv = insert_args,
+        make = compile(table_name .. "_insert", insert_statement),
+      },
+      upsert = {
+        expr = upsert_expressions,
+        argn = insert_names,
+        argc = insert_count,
+        argv = insert_args,
+        make = compile(table_name .. "_upsert", upsert_statement),
+      },
+      update = {
+        expr = update_expressions,
+        placeholders = update_placeholders,
+        argn = update_args_names,
+        argc = update_args_count,
+        argv = update_args,
+        make = compile(table_name .. "_update", update_statement),
+      },
+      delete = {
+        argn = primary_key_names,
+        argc = primary_key_count,
+        argv = primary_key_args,
+        make = compile(table_name .. "_delete", delete_statement),
+      },
+      select = {
+        expr = select_expressions,
+        argn = primary_key_names,
+        argc = primary_key_count,
+        argv = primary_key_args,
+        make = compile(table_name .. "_select", select_statement),
+      },
+      page_first = {
+        argn = { LIMIT },
+        argc = 1,
+        argv = single_args,
+        make = compile(table_name .. "_first", page_first_statement),
+      },
+      page_next = {
+        argn = page_next_names,
+        argc = page_next_count,
+        argv = page_next_args,
+        make = compile(table_name .. "_next", page_next_statement),
+      },
+    },
+  }, _mt)
+
+  if foreign_key_count > 0 then
+    local statements = self.statements
+
+    for foreign_entity_name, foreign_key in pairs(foreign_keys) do
+      local fk_names = foreign_key.names
+      local fk_escaped = foreign_key.escaped
+      local fk_count = foreign_key.count
+
+      local fk_placeholders = {}
+      local pk_placeholders = {}
+
+      local foreign_key_names = concat(fk_escaped, ", ")
+
+      local argc_first = fk_count + 1
+      local argv_first = new_tab(argc_first, 0)
+      local argn_first = new_tab(argc_first, 0)
+      local argc_next = argc_first + primary_key_count
+      local argv_next = new_tab(argc_next, 0)
+      local argn_next = new_tab(argc_next, 0)
+
+      for i = 1, fk_count do
+        argn_first[i] = fk_names[i]
+        argn_next[i] = fk_names[i]
+        fk_placeholders[i] = "$" .. i
+      end
+
+      for i = 1, primary_key_count do
+        local index = i + fk_count
+        argn_next[index] = primary_key_names[i]
+        pk_placeholders[i] = "$" .. index
+      end
+
+      argn_first[argc_first] = LIMIT
+      argn_next[argc_next] = LIMIT
+
+      fk_placeholders = concat(fk_placeholders, ", ")
+      pk_placeholders = concat(pk_placeholders, ", ")
+
+      if ttl then
+        page_first_statement = concat {
+          "  SELECT ", select_expressions, "\n",
+          "    FROM ", table_name_escaped, "\n",
+          "   WHERE (", foreign_key_names, ") = (", fk_placeholders, ")\n",
+          "     AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP)\n",
+          "ORDER BY ", pk_escaped, "\n",
+          "   LIMIT $", argc_first, ";";
+	      }
+
+        page_next_statement = concat {
+          "  SELECT ", select_expressions, "\n",
+          "    FROM ", table_name_escaped, "\n",
+          "   WHERE (", foreign_key_names, ") = (", fk_placeholders, ")\n",
+          "     AND (", pk_escaped, ") > (", pk_placeholders, ")\n",
+          "     AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP)\n",
+          "ORDER BY ", pk_escaped, "\n",
+          "   LIMIT $", argc_next, ";"
+        }
+
+      else
+        page_first_statement = concat {
+          "  SELECT ", select_expressions, "\n",
+          "    FROM ", table_name_escaped, "\n",
+          "   WHERE (", foreign_key_names, ") = (", fk_placeholders, ")\n",
+          "ORDER BY ", pk_escaped, "\n",
+          "   LIMIT $", argc_first, ";";
+	      }
+
+        page_next_statement = concat {
+          "  SELECT ", select_expressions, "\n",
+          "    FROM ", table_name_escaped, "\n",
+          "   WHERE (", foreign_key_names, ") = (", fk_placeholders, ")\n",
+          "     AND (", pk_escaped, ") > (", pk_placeholders, ")\n",
+          "ORDER BY ", pk_escaped, "\n",
+          "   LIMIT $", argc_next, ";"
+        }
+      end
+
+      local statement_name = "page_for_" .. foreign_entity_name
+
+      statements[statement_name .. "_first"] = {
+        argn = argn_first,
+        argc = argc_first,
+        argv = argv_first,
+        make = compile(concat({ table_name, statement_name, "first" }, "_"), page_first_statement),
+      }
+
+      statements[statement_name .. "_next"] = {
+        argn = argn_next,
+        argc = argc_next,
+        argv = argv_next,
+        make = compile(concat({ table_name, statement_name, "next" }, "_"), page_next_statement)
+      }
+
+      self[statement_name] = make_select_for(foreign_entity_name)
+    end
+  end
+
+  if tags then
+    local statements = self.statements
+    local pk_placeholders = {}
+
+    local argc_first = 2
+    local argv_first = new_tab(argc_first, 0)
+    local argn_first = new_tab(argc_first, 0)
+    local argc_next  = argc_first + primary_key_count
+    local argv_next  = new_tab(argc_next, 0)
+    local argn_next  = new_tab(argc_next, 0)
+
+    for i = 1, primary_key_count do
+      local index = i + 1
+      argn_next[index]   = primary_key_names[i]
+      pk_placeholders[i] = "$" .. index
+    end
+
+    pk_placeholders = concat(pk_placeholders, ", ")
+
+    argn_first[1] = "tags"
+    argn_first[argc_first] = LIMIT
+    argn_next[1] = "tags"
+    argn_next[argc_next] = LIMIT
+
+    local page_first_by_tags_statement
+    local page_next_by_tags_statement
+
+    for cond, op in pairs({["_and"] = "@>", ["_or"] = "&&"}) do
+
+      if ttl then
+        page_first_by_tags_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE tags ", op, " $1\n",
+          "     AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP)\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $2;";
+        }
+
+        page_next_by_tags_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE tags ", op, " $1\n",
+          "     AND (", pk_escaped, ") > (", pk_placeholders, ")\n",
+          "     AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP)\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $", argc_next, ";"
+        }
+      else
+        page_first_by_tags_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE tags ", op, " $1\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $2;";
+        }
+
+        page_next_by_tags_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE tags ", op, " $1\n",
+          "     AND (", pk_escaped, ") > (", pk_placeholders, ")\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $", argc_next, ";"
+        }
+      end
+
+      local statement_name = "page_by_tags"
+
+      statements[statement_name .. cond .. "_first"] = {
+        argn = argn_first,
+        argc = argc_first,
+        argv = argv_first,
+        make = compile(concat({ table_name, statement_name, "first" }, "_"), page_first_by_tags_statement),
+      }
+
+      statements[statement_name .. cond .. "_next"] = {
+        argn = argn_next,
+        argc = argc_next,
+        argv = argv_next,
+        make = compile(concat({ table_name, statement_name, "next" }, "_"), page_next_by_tags_statement)
+      }
+    end
+  end
+
+  if composite_cache_key then
+    unique_fields_count = unique_fields_count + 1
+    insert(unique_fields, {
+      name = "cache_key",
+      name_escaped = escape_identifier(connector, "cache_key"),
+    })
+  end
+
+  if unique_fields_count > 0 then
+    local update_by_args_count = update_fields_count + 1
+    local update_by_args = new_tab(update_by_args_count, 0)
+    local statements = self.statements
+
+    for i = 1, unique_fields_count do
+      local unique_field = unique_fields[i]
+      local unique_name = unique_field.name
+      local unique_escaped = unique_field.name_escaped
+      local single_names = { unique_name }
+
+      local select_by_statement_name = "select_by_" .. unique_name
+      local select_by_statement
+
+      if ttl then
+        select_by_statement = concat {
+          "SELECT ", select_expressions, "\n",
+          "  FROM ", table_name_escaped, "\n",
+          " WHERE ", unique_escaped, " = $1\n",
+          "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP)\n",
+          " LIMIT 1;"
+	      }
+
+      else
+        select_by_statement = concat {
+          "SELECT ", select_expressions, "\n",
+          "  FROM ", table_name_escaped, "\n",
+          " WHERE ", unique_escaped, " = $1\n",
+          " LIMIT 1;"
+        }
+      end
+
+      statements[select_by_statement_name] = {
+        argn = single_names,
+        argc = 1,
+        argv = single_args,
+        make = compile(concat({ table_name, select_by_statement_name }, "_"), select_by_statement),
+      }
+
+      local update_by_statement_name = "update_by_" .. unique_name
+      local update_by_statement
+
+      if ttl then
+        update_by_statement = concat {
+          "   UPDATE ", table_name_escaped, "\n",
+          "      SET ", update_expressions, "\n",
+          "    WHERE ", unique_escaped, " = $", update_by_args_count, "\n",
+          "      AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP);",
+        }
+      else
+        update_by_statement = concat {
+          "   UPDATE ", table_name_escaped, "\n",
+          "      SET ", update_expressions, "\n",
+          "    WHERE ", unique_escaped, " = $", update_by_args_count, ";",
+        }
+      end
+
+      local update_by_args_names = {}
+      for i = 1, update_fields_count do
+	      update_by_args_names[i] = update_names[i]
+      end
+
+      update_by_args_names[update_by_args_count] = unique_name
+      statements[update_by_statement_name] = {
+        argn = update_by_args_names,
+        argc = update_by_args_count,
+        argv = update_by_args,
+        make = compile(concat({ table_name, update_by_statement_name }, "_"), update_by_statement),
+      }
+
+      local upsert_by_statement_name = "upsert_by_" .. unique_name
+      local conflict_key = unique_escaped
+      if composite_cache_key then
+        conflict_key = escape_identifier(connector, "cache_key")
+      end
+      local upsert_by_statement = concat {
+        "REPLACE INTO ", table_name_escaped, " (", insert_columns, ")\n",
+        "     VALUES (", insert_expressions, ");",
+      }
+
+      statements[upsert_by_statement_name] = {
+        argn = insert_names,
+        argc = insert_count,
+        argv = insert_args,
+        make = compile(concat({ table_name, upsert_by_statement_name }, "_"), upsert_by_statement),
+      }
+
+      local delete_by_statement_name = "delete_by_" .. unique_name
+      local delete_by_statement
+
+      if ttl then
+        delete_by_statement = concat {
+          "DELETE\n",
+          "  FROM ", table_name_escaped, "\n",
+          " WHERE ", unique_escaped, " = $1\n",
+          "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP);",
+        }
+
+      else
+        delete_by_statement = concat {
+          "DELETE\n",
+          "  FROM ", table_name_escaped, "\n",
+          " WHERE ", unique_escaped, " = $1;",
+        }
+      end
+
+      statements[delete_by_statement_name] = {
+        argn = single_names,
+        argc = 1,
+        argv = single_args,
+        make = compile(concat({ table_name, delete_by_statement_name }, "_"), delete_by_statement),
+      }
+    end
+  end
+
+  return self
+end
+
+return _M
+
+
+---------
+
+
+kong\db\strategies\mysql\plugins.lua
+
+
+local split = require("pl.stringx").split
+
+
+local insert = table.insert
+
+
+local Plugins = {}
+
+
+-- Emulate the `select_by_cache_key` operation
+-- using the `plugins` table of a 0.14 database.
+-- @tparam string key a 0.15+ plugin cache_key
+-- @treturn table|nil,err the row for this unique cache_key
+-- or nil and an error object.
+function Plugins:select_by_cache_key_migrating(key)
+  -- unpack cache_key
+  local parts = split(key, ":")
+  -- build query and args
+
+  local qbuild = { "SELECT " ..
+                     self.statements.select.expr ..
+                     " FROM plugins WHERE name = " ..
+                     self:escape_literal(parts[2]) }
+  for i, field in ipairs({
+    "route_id",
+    "service_id",
+    "consumer_id",
+    "api_id",
+  }) do
+    local id = parts[i + 2]
+    if id ~= "" then
+      insert(qbuild, field .. " = '" .. id .. "'")
+    else
+      insert(qbuild, field .. " IS NULL")
+    end
+  end
+  local query = table.concat(qbuild, " AND ")
+
+  -- perform query
+  local res, err = self.connector:query(query)
+  if res and res[1] then
+    res[1].cache_key = nil
+    return self.expand(res[1]), nil
+  end
+
+  -- not found
+  return nil, err
+end
+
+
+return Plugins
+
+
+---------------------
+
+kong\db\strategies\mysql\tags.lua
+
+local cjson         = require "cjson"
+local cjson_safe    = require "cjson.safe"
+local encode_base64 = ngx.encode_base64
+local decode_base64 = ngx.decode_base64
+local fmt           = string.format
+
+
+local Tags = {}
+
+local sql_templates = {
+  page_first = [[
+  SELECT entity_id, entity_name, tag, ordinality
+    FROM tags,
+    UNNEST(tags) WITH ORDINALITY as t_tag (tag, ordinality)
+    ORDER BY entity_id
+    LIMIT %s;]],
+  page_next  = [[
+  SELECT entity_id, entity_name, tag, ordinality
+    FROM tags,
+    UNNEST(tags) WITH ORDINALITY as t_tag (tag, ordinality)
+    WHERE entity_id > %s OR (entity_id = %s AND ordinality > %s)
+    ORDER BY entity_id
+    LIMIT %s;]],
+  page_for_tag_first = [[
+  SELECT entity_id, entity_name
+    FROM tags
+    WHERE %s = ANY(tags)
+    ORDER BY entity_id
+    LIMIT %s;]],
+  page_for_tag_next  = [[
+  SELECT entity_id, entity_name
+    FROM tags
+    WHERE entity_id > %s AND %s = ANY(tags)
+    ORDER BY entity_id
+    LIMIT %s;]],
+}
+
+local function page(self, size, token, options, tag)
+  local limit = size + 1
+
+  local sql
+  local args
+
+  local tag_literal
+  if tag then
+    tag_literal = self:escape_literal(tag)
+  end
+
+  if token then
+    local token_decoded = decode_base64(token)
+    if not token_decoded then
+      return nil, self.errors:invalid_offset(token, "bad base64 encoding")
+    end
+
+    token_decoded = cjson_safe.decode(token_decoded)
+    if not token_decoded then
+      return nil, self.errors:invalid_offset(token, "bad json encoding")
+    end
+
+    local entity_id_delimeter = self:escape_literal(token_decoded[1])
+
+    if tag then
+      sql = sql_templates.page_for_tag_next
+      args = {
+        entity_id_delimeter,
+        tag_literal, limit
+      }
+    else
+      sql = sql_templates.page_next
+      local ordinality_delimeter = self:escape_literal(token_decoded[2])
+      args = {
+        entity_id_delimeter, entity_id_delimeter,
+        ordinality_delimeter, limit
+      }
+    end
+  else
+    if tag then
+      sql = sql_templates.page_for_tag_first
+      args = { tag_literal, limit  }
+    else
+      sql = sql_templates.page_first
+      args = { limit }
+    end
+  end
+
+  sql = fmt(sql, unpack(args))
+
+  local res, err = self.connector:query(sql)
+
+  if not res then
+    return nil, self.errors:database_error(err)
+  end
+
+  local rows = kong.table.new(size, 0)
+
+  local last_ordinality
+
+  for i = 1, limit do
+    local row = res[i]
+    if not row then
+      break
+    end
+
+    if i == limit then
+      row = res[size]
+      local offset = {
+        row.entity_id,
+        last_ordinality
+      }
+
+      offset = cjson.encode(offset)
+      offset = encode_base64(offset, true)
+
+      return rows, nil, offset
+    end
+
+    last_ordinality = row.ordinality
+    row.ordinality = nil
+
+    if tag then
+      row.tag = tag
+    end
+    rows[i] = self.expand(row)
+  end
+
+  return rows
+
+end
+
+function Tags:page_by_tag(tag, size, token, options)
+  return page(self, size, token, options, tag)
+end
+
+-- Overwrite the page function for /tags
+function Tags:page(size, token, options)
+  return page(self, size, token, options)
+end
+
+
+return Tags
+
+
+----------------------
+
+kong\router.lua
+
+local lrucache      = require "resty.lrucache"
+local utils         = require "kong.tools.utils"
+local px            = require "resty.mediador.proxy"
+local bit           = require "bit"
+local logger = require "kong.cmd.utils.log"
+local cjson = require "cjson"
+local cjson_safe = require "cjson.safe"
+
+local hostname_type = utils.hostname_type
+local subsystem     = ngx.config.subsystem
+local get_method    = ngx.req.get_method
+local get_headers   = ngx.req.get_headers
+local re_match      = ngx.re.match
+local re_find       = ngx.re.find
+local header        = ngx.header
+local var           = ngx.var
+local ngx_log       = ngx.log
+local insert        = table.insert
+local sort          = table.sort
+local upper         = string.upper
+local lower         = string.lower
+local find          = string.find
+local sub           = string.sub
+local tonumber      = tonumber
+local ipairs        = ipairs
+local pairs         = pairs
+local error         = error
+local type          = type
+local max           = math.max
+local band          = bit.band
+local bor           = bit.bor
+
+
+local ERR           = ngx.ERR
+local WARN          = ngx.WARN
+
+
+local clear_tab
+local log
+do
+  log = function(lvl, ...)
+    ngx_log(lvl, "[router] ", ...)
+  end
+
+  local ok
+  ok, clear_tab = pcall(require, "table.clear")
+  if not ok then
+    clear_tab = function(tab)
+      for k in pairs(tab) do
+        tab[k] = nil
+      end
+    end
+  end
+end
+
+
+--[[
+Hypothesis
+----------
+
+Item size:        1024 bytes
+Max memory limit: 5 MiBs
+
+LRU size must be: (5 * 2^20) / 1024 = 5120
+Floored: 5000 items should be a good default
+--]]
+local MATCH_LRUCACHE_SIZE = 5e3
+
+
+local MATCH_RULES = {
+  HOST            = 0x00000040,
+  HEADER          = 0x00000020,
+  URI             = 0x00000010,
+  METHOD          = 0x00000008,
+  SNI             = 0x00000004,
+  SRC             = 0x00000002,
+  DST             = 0x00000001,
+}
+
+local SORTED_MATCH_RULES = {}
+
+for _, v in pairs(MATCH_RULES) do
+  insert(SORTED_MATCH_RULES, v)
+end
+
+sort(SORTED_MATCH_RULES, function(a, b)
+  return a > b
+end)
+
+local MATCH_SUBRULES = {
+  HAS_REGEX_URI    = 0x01,
+  PLAIN_HOSTS_ONLY = 0x02,
+}
+
+local EMPTY_T = {}
+local MAX_REQ_HEADERS = 100
+
+
+local match_route
+local reduce
+
+
+local function _set_ngx(mock_ngx)
+  if type(mock_ngx) ~= "table" then
+    return
+  end
+
+  if mock_ngx.header then
+    header = mock_ngx.header
+  end
+
+  if mock_ngx.var then
+    var = mock_ngx.var
+  end
+
+  if mock_ngx.log then
+    ngx_log = mock_ngx.log
+  end
+
+  if mock_ngx.ERR then
+    ERR = mock_ngx.ERR
+  end
+
+  if type(mock_ngx.req) == "table" then
+    if mock_ngx.req.get_method then
+      get_method = mock_ngx.req.get_method
+    end
+
+    if mock_ngx.req.get_headers then
+      get_headers = mock_ngx.req.get_headers
+    end
+  end
+
+  if type(mock_ngx.config) == "table" then
+    if mock_ngx.config.subsystem then
+      subsystem = mock_ngx.config.subsystem
+    end
+  end
+
+  if type(mock_ngx.re) == "table" then
+    if mock_ngx.re.match then
+      re_match = mock_ngx.re.match
+    end
+
+    if mock_ngx.re.find then
+      re_find = mock_ngx.re.find
+    end
+  end
+end
+
+
+local function has_capturing_groups(subj)
+  local s =      find(subj, "[^\\]%(.-[^\\]%)")
+        s = s or find(subj, "^%(.-[^\\]%)")
+        s = s or find(subj, "%(%)")
+
+  return s ~= nil
+end
+
+
+local protocol_subsystem = {
+  http = "http",
+  https = "http",
+  tcp = "stream",
+  tls = "stream",
+}
+
+local function marshall_route(r)
+  local route        = r.route
+  local service      = r.service
+  local hosts        = route.hosts
+  local headers      = route.headers
+  local paths        = route.paths
+  local methods      = route.methods
+  local snis         = route.snis
+  local sources      = route.sources
+  local destinations = route.destinations
+
+  local protocol
+  if service then
+    protocol = service.protocol
+  end
+
+  if not (hosts or headers or methods or paths or snis or sources
+          or destinations)
+  then
+    return nil, "could not categorize route"
+  end
+
+  if type(route.strip_path) == "number" then
+    if route.strip_path > 0 then
+      route.strip_path = true
+    else
+      route.strip_path = false
+    end
+  end
+
+  local route_t    = {
+    type           = protocol_subsystem[protocol],
+    route          = route,
+    service        = service,
+    strip_uri      = route.strip_path    == true,
+    preserve_host  = route.preserve_host == true,
+    match_rules    = 0x00,
+    match_weight   = 0,
+    submatch_weight = 0,
+    max_uri_length = 0,
+    hosts          = {},
+    headers        = {},
+    uris           = {},
+    methods        = {},
+    sources        = {},
+    destinations   = {},
+    snis           = {},
+    upstream_url_t = {},
+  }
+
+
+  -- hosts
+
+
+  if hosts then
+
+    if type(hosts) ~= "table" then
+      hosts = cjson_safe.decode(hosts)
+    end
+
+    if type(hosts) ~= "table" then
+      return nil, "hosts field must be a table"
+    end
+
+    local has_host_wildcard
+    local has_host_plain
+
+    for _, host in ipairs(hosts) do
+      if type(host) ~= "string" then
+        return nil, "hosts values must be strings"
+      end
+
+      if find(host, "*", nil, true) then
+        -- wildcard host matching
+        has_host_wildcard = true
+
+        local wildcard_host_regex = host:gsub("%.", "\\.")
+                                        :gsub("%*", ".+") .. "$"
+        insert(route_t.hosts, {
+          wildcard = true,
+          value    = host,
+          regex    = wildcard_host_regex,
+        })
+
+      else
+        -- plain host matching
+        has_host_plain = true
+
+        route_t.hosts[host] = host
+
+        insert(route_t.hosts, {
+          value = host,
+        })
+      end
+    end
+
+    if has_host_plain or has_host_wildcard then
+      route_t.match_rules = bor(route_t.match_rules, MATCH_RULES.HOST)
+      route_t.match_weight = route_t.match_weight + 1
+    end
+
+    if not has_host_wildcard then
+      route_t.submatch_weight = bor(route_t.submatch_weight,
+                                    MATCH_SUBRULES.PLAIN_HOSTS_ONLY)
+    end
+  end
+
+
+  -- headers
+
+
+  if headers then
+    if type(headers) ~= "table" then
+      headers = cjson_safe.decode(headers)
+    end
+
+    if type(headers) ~= "table" then
+      return nil, "headers field must be a table"
+    end
+
+    local has_header_plain
+
+    for header_name, header_values in pairs(headers) do
+      if type(header_values) ~= "table" then
+        return nil, "header values must be a table for header '" ..
+                    header_name .. "'"
+      end
+
+      header_name = lower(header_name)
+
+      if header_name ~= "host" then
+        -- plain header matching
+        has_header_plain = true
+
+        local header_values_map = {}
+        for i, header_value in ipairs(header_values) do
+          header_values_map[lower(header_value)] = true
+        end
+
+        insert(route_t.headers, {
+          name = header_name,
+          values_map = header_values_map,
+        })
+      end
+    end
+
+    if has_header_plain then
+      route_t.match_rules = bor(route_t.match_rules, MATCH_RULES.HEADER)
+      route_t.match_weight = route_t.match_weight + 1
+    end
+  end
+
+
+  -- paths
+
+
+  if paths then
+
+    if type(paths) ~= "table" then
+      paths = cjson_safe.decode(paths)
+    end
+
+    if type(paths) ~= "table" then
+      return nil, "paths field must be a table"
+    end
+
+    if #paths > 0 then
+      route_t.match_rules = bor(route_t.match_rules, MATCH_RULES.URI)
+      route_t.match_weight = route_t.match_weight + 1
+
+      for _, path in ipairs(paths) do
+        if re_find(path, [[^[a-zA-Z0-9\.\-_~/%]*$]]) then
+          -- plain URI or URI prefix
+
+          local uri_t = {
+            is_prefix = true,
+            value     = path,
+          }
+
+          route_t.uris[path] = uri_t
+          insert(route_t.uris, uri_t)
+          route_t.max_uri_length = max(route_t.max_uri_length, #path)
+
+        else
+          -- regex URI
+          local strip_regex  = path .. [[(?<uri_postfix>.*)]]
+          local has_captures = has_capturing_groups(path)
+
+          local uri_t    = {
+            is_regex     = true,
+            value        = path,
+            regex        = path,
+            has_captures = has_captures,
+            strip_regex  = strip_regex,
+          }
+
+          route_t.uris[path] = uri_t
+          insert(route_t.uris, uri_t)
+
+          route_t.submatch_weight = bor(route_t.submatch_weight,
+                                        MATCH_SUBRULES.HAS_REGEX_URI)
+        end
+      end
+    end
+  end
+
+
+  -- methods
+
+
+  if methods then
+    if type(methods) ~= "table" then
+      methods = cjson_safe.decode(methods)
+    end
+
+    if type(methods) ~= "table" then
+      return nil, "methods field must be a table"
+    end
+
+    if #methods > 0 then
+      route_t.match_rules = bor(route_t.match_rules, MATCH_RULES.METHOD)
+      route_t.match_weight = route_t.match_weight + 1
+
+      for _, method in ipairs(methods) do
+        route_t.methods[upper(method)] = true
+      end
+    end
+  end
+
+
+  -- sources
+
+
+  if sources then
+    if type(sources) ~= "table" then
+      sources = cjson_safe.decode(sources)
+    end
+
+    if type(sources) ~= "table" then
+      return nil, "sources field must be a table"
+    end
+
+    if #sources > 0 then
+      route_t.match_rules = bor(route_t.match_rules, MATCH_RULES.SRC)
+      route_t.match_weight = route_t.match_weight + 1
+
+      for _, source in ipairs(sources) do
+        if type(source) ~= "table" then
+          return nil, "sources elements must be tables"
+        end
+
+        local range_f
+
+        if source.ip and find(source.ip, "/", nil, true) then
+          range_f = px.compile(source.ip)
+        end
+
+        insert(route_t.sources, {
+          ip = source.ip,
+          port = source.port,
+          range_f = range_f,
+        })
+      end
+    end
+  end
+
+
+  -- destinations
+
+
+  if destinations then
+    if type(destinations) ~= "table" then
+      destinations = cjson_safe.decode(destinations)
+    end
+
+    if type(destinations) ~= "table" then
+      return nil, "destinations field must be a table"
+    end
+
+    if #destinations > 0 then
+      route_t.match_rules = bor(route_t.match_rules, MATCH_RULES.DST)
+      route_t.match_weight = route_t.match_weight + 1
+
+      for _, destination in ipairs(destinations) do
+        if type(destination) ~= "table" then
+          return nil, "destinations elements must be tables"
+        end
+
+        local range_f
+
+        if destination.ip and find(destination.ip, "/", nil, true) then
+          range_f = px.compile(destination.ip)
+        end
+
+        insert(route_t.destinations, {
+          ip = destination.ip,
+          port = destination.port,
+          range_f = range_f,
+        })
+      end
+    end
+  end
+
+
+  -- snis
+
+
+  if snis then
+    if type(snis) ~= "table" then
+      snis = cjson_safe.decode(snis)
+    end
+
+    if type(snis) ~= "table" then
+      return nil, "snis field must be a table"
+    end
+
+    if #snis > 0 then
+      for _, sni in ipairs(snis) do
+        if type(sni) ~= "string" then
+          return nil, "sni elements must be strings"
+        end
+
+        route_t.match_rules = bor(route_t.match_rules, MATCH_RULES.SNI)
+        route_t.match_weight = route_t.match_weight + 1
+        route_t.snis[sni] = sni
+      end
+    end
+  end
+
+
+  -- upstream_url parsing
+
+
+  if protocol then
+    route_t.upstream_url_t.scheme = protocol
+  end
+
+  local s = service or EMPTY_T
+
+  local host = s.host
+  if host then
+    route_t.upstream_url_t.host = host
+    route_t.upstream_url_t.type = hostname_type(host)
+
+  else
+    route_t.upstream_url_t.type = hostname_type("")
+  end
+
+  local port = s.port
+  if port then
+    route_t.upstream_url_t.port = port
+
+  else
+    if protocol == "https" then
+      route_t.upstream_url_t.port = 443
+
+    elseif protocol == "http" then
+      route_t.upstream_url_t.port = 80
+    end
+  end
+
+  if route_t.type == "http" then
+    route_t.upstream_url_t.path = s.path or "/"
+  end
+
+  return route_t
+end
+
+
+local function index_route_t(route_t, plain_indexes, prefix_uris, regex_uris,
+                             wildcard_hosts, src_trust_funcs, dst_trust_funcs)
+  for _, host_t in ipairs(route_t.hosts) do
+    if host_t.wildcard then
+      insert(wildcard_hosts, host_t)
+
+    else
+      plain_indexes.hosts[host_t.value] = true
+    end
+  end
+
+  for _, header_t in ipairs(route_t.headers) do
+    if not plain_indexes.headers[header_t.name] then
+      plain_indexes.headers[header_t.name] = true
+      insert(plain_indexes.headers, header_t.name)
+    end
+  end
+
+  for _, uri_t in ipairs(route_t.uris) do
+    if uri_t.is_prefix then
+      plain_indexes.uris[uri_t.value] = true
+      insert(prefix_uris, uri_t)
+
+    else
+      insert(regex_uris, uri_t)
+    end
+  end
+
+  for method in pairs(route_t.methods) do
+    plain_indexes.methods[method] = true
+  end
+
+  for _, src_t in ipairs(route_t.sources) do
+    if src_t.ip then
+      plain_indexes.sources[src_t.ip] = true
+
+      if src_t.range_f then
+        insert(src_trust_funcs, src_t.range_f)
+      end
+    end
+
+    if src_t.port then
+      plain_indexes.sources[src_t.port] = true
+    end
+  end
+
+  for _, dst_t in ipairs(route_t.destinations) do
+    if dst_t.ip then
+      plain_indexes.destinations[dst_t.ip] = true
+
+      if dst_t.range_f then
+        insert(dst_trust_funcs, dst_t.range_f)
+      end
+    end
+
+    if dst_t.port then
+      plain_indexes.destinations[dst_t.port] = true
+    end
+  end
+
+  for sni in pairs(route_t.snis) do
+    plain_indexes.snis[sni] = true
+  end
+end
+
+
+local function categorize_route_t(route_t, bit_category, categories)
+  local category = categories[bit_category]
+  if not category then
+    category                 = {
+      match_weight           = route_t.match_weight,
+      routes_by_hosts        = {},
+      routes_by_headers      = {},
+      routes_by_uris         = {},
+      routes_by_methods      = {},
+      routes_by_sources      = {},
+      routes_by_destinations = {},
+      routes_by_sni          = {},
+      all                    = {},
+    }
+
+    categories[bit_category] = category
+  end
+
+  insert(category.all, route_t)
+
+  for _, host_t in ipairs(route_t.hosts) do
+    if not category.routes_by_hosts[host_t.value] then
+      category.routes_by_hosts[host_t.value] = {}
+    end
+
+    insert(category.routes_by_hosts[host_t.value], route_t)
+  end
+
+  for _, header_t in ipairs(route_t.headers) do
+    if not category.routes_by_headers[header_t.name] then
+      category.routes_by_headers[header_t.name] = {}
+    end
+
+    insert(category.routes_by_headers[header_t.name], route_t)
+  end
+
+  for _, uri_t in ipairs(route_t.uris) do
+    if not category.routes_by_uris[uri_t.value] then
+      category.routes_by_uris[uri_t.value] = {}
+    end
+
+    insert(category.routes_by_uris[uri_t.value], route_t)
+  end
+
+  for method in pairs(route_t.methods) do
+    if not category.routes_by_methods[method] then
+      category.routes_by_methods[method] = {}
+    end
+
+    insert(category.routes_by_methods[method], route_t)
+  end
+
+  for _, src_t in ipairs(route_t.sources) do
+    if src_t.ip then
+      if not category.routes_by_sources[src_t.ip] then
+        category.routes_by_sources[src_t.ip] = {}
+      end
+
+      insert(category.routes_by_sources[src_t.ip], route_t)
+    end
+
+    if src_t.port then
+      if not category.routes_by_sources[src_t.port] then
+        category.routes_by_sources[src_t.port] = {}
+      end
+
+      insert(category.routes_by_sources[src_t.port], route_t)
+    end
+  end
+
+  for _, dst_t in ipairs(route_t.destinations) do
+    if dst_t.ip then
+      if not category.routes_by_destinations[dst_t.ip] then
+        category.routes_by_destinations[dst_t.ip] = {}
+      end
+
+      insert(category.routes_by_destinations[dst_t.ip], route_t)
+    end
+
+    if dst_t.port then
+      if not category.routes_by_destinations[dst_t.port] then
+        category.routes_by_destinations[dst_t.port] = {}
+      end
+
+      insert(category.routes_by_destinations[dst_t.port], route_t)
+    end
+  end
+
+  for sni in pairs(route_t.snis) do
+    if not category.routes_by_sni[sni] then
+      category.routes_by_sni[sni] = {}
+    end
+
+    insert(category.routes_by_sni[sni], route_t)
+  end
+end
+
+
+do
+  local matchers = {
+    [MATCH_RULES.HOST] = function(route_t, ctx)
+      local host = route_t.hosts[ctx.hits.host or ctx.req_host]
+      if host then
+        ctx.matches.host = host
+        return true
+      end
+
+      for i = 1, #route_t.hosts do
+        local host_t = route_t.hosts[i]
+
+        if host_t.wildcard then
+          local from, _, err = re_find(ctx.req_host, host_t.regex, "ajo")
+          if err then
+            log(ERR, "could not evaluate wildcard host regex: ", err)
+            return
+          end
+
+          if from then
+            ctx.matches.host = host_t.value
+            return true
+          end
+        end
+      end
+    end,
+
+    [MATCH_RULES.HEADER] = function(route_t, ctx)
+      ctx.matches.headers = {}
+
+      for _, header_t in ipairs(route_t.headers) do
+        local found_in_req
+        local req_header = ctx.req_headers[header_t.name]
+
+        if type(req_header) == "table" then
+          for _, req_header_val in ipairs(req_header) do
+            req_header_val = lower(req_header_val)
+            if header_t.values_map[req_header_val] then
+              found_in_req = true
+              ctx.matches.headers[header_t.name] = req_header_val
+              break
+            end
+          end
+
+        elseif req_header then -- string
+          req_header = lower(req_header)
+          if header_t.values_map[req_header] then
+            found_in_req = true
+            ctx.matches.headers[header_t.name] = req_header
+          end
+        end
+
+        if not found_in_req then
+          return
+        end
+      end
+
+      return true
+    end,
+
+    [MATCH_RULES.URI] = function(route_t, ctx)
+      do
+        local uri_t = route_t.uris[ctx.hits.uri or ctx.req_uri]
+
+        if uri_t then
+          if uri_t.is_regex then
+            local m, err = re_match(ctx.req_uri, uri_t.strip_regex, "ajo")
+            if err then
+              log(ERR, "could not evaluate URI prefix/regex: ", err)
+              return
+            end
+
+            if m then
+              ctx.matches.uri_postfix = m.uri_postfix
+              ctx.matches.uri = uri_t.value
+
+              if m.uri_postfix then
+                -- remove the uri_postfix group
+                m[#m]          = nil
+                m.uri_postfix = nil
+              end
+
+              if uri_t.has_captures then
+                ctx.matches.uri_captures = m
+              end
+
+              return true
+            end
+          end
+
+          -- plain or prefix match from the index
+          ctx.matches.uri_postfix = sub(ctx.req_uri, #uri_t.value + 1)
+          ctx.matches.uri = uri_t.value
+
+          return true
+        end
+      end
+
+      for i = 1, #route_t.uris do
+        local uri_t = route_t.uris[i]
+
+        if uri_t.is_regex then
+          local m, err = re_match(ctx.req_uri, uri_t.strip_regex, "ajo")
+          if err then
+            log(ERR, "could not evaluate URI prefix/regex: ", err)
+            return
+          end
+
+          if m then
+            ctx.matches.uri_postfix = m.uri_postfix
+            ctx.matches.uri = uri_t.value
+
+            if m.uri_postfix then
+              -- remove the uri_postfix group
+              m[#m]          = nil
+              m.uri_postfix = nil
+            end
+
+            if uri_t.has_captures then
+              ctx.matches.uri_captures = m
+            end
+
+            return true
+          end
+
+        else
+          -- plain or prefix match (not from the index)
+          local from, to = find(ctx.req_uri, uri_t.value, nil, true)
+          if from == 1 then
+            ctx.matches.uri_postfix = sub(ctx.req_uri, to + 1)
+            ctx.matches.uri = uri_t.value
+
+            return true
+          end
+        end
+      end
+    end,
+
+    [MATCH_RULES.METHOD] = function(route_t, ctx)
+      local method = route_t.methods[ctx.req_method]
+      if method then
+        ctx.matches.method = ctx.req_method
+
+        return true
+      end
+    end,
+
+    [MATCH_RULES.SRC] = function(route_t, ctx)
+      for _, src_t in ipairs(route_t.sources) do
+        local ip_ok
+        local port_ok
+
+        if not src_t.ip then
+          ip_ok = true
+        elseif src_t.range_f then
+          ip_ok = src_t.range_f(ctx.src_ip)
+        else
+          ip_ok = src_t.ip == ctx.src_ip
+        end
+
+        if not src_t.port or (src_t.port == ctx.src_port) then
+          port_ok = true
+        end
+
+        if ip_ok and port_ok then
+          ctx.matches.src_ip = src_t.ip
+          ctx.matches.src_port = src_t.port
+          return true
+        end
+      end
+    end,
+
+    [MATCH_RULES.DST] = function(route_t, ctx)
+      for _, dst_t in ipairs(route_t.destinations) do
+        local ip_ok
+        local port_ok
+
+        if not dst_t.ip then
+          ip_ok = true
+        elseif dst_t.range_f then
+          ip_ok = dst_t.range_f(ctx.dst_ip)
+        else
+          ip_ok = dst_t.ip == ctx.dst_ip
+        end
+
+        if not dst_t.port or (dst_t.port == ctx.dst_port) then
+          port_ok = true
+        end
+
+        if ip_ok and port_ok then
+          ctx.matches.dst_ip = dst_t.ip
+          ctx.matches.dst_port = dst_t.port
+          return true
+        end
+      end
+    end,
+
+    [MATCH_RULES.SNI] = function(route_t, ctx)
+      local sni = route_t.snis[ctx.sni]
+      if sni then
+        ctx.matches.sni = ctx.sni
+        return true
+      end
+    end,
+  }
+
+
+  match_route = function(route_t, ctx)
+    -- run cached matcher
+    if type(matchers[route_t.match_rules]) == "function" then
+      clear_tab(ctx.matches)
+      return matchers[route_t.match_rules](route_t, ctx)
+    end
+
+    -- build and cache matcher
+
+    local matchers_set = {}
+
+    for _, bit_match_rule in pairs(MATCH_RULES) do
+      if band(route_t.match_rules, bit_match_rule) ~= 0 then
+        matchers_set[#matchers_set + 1] = matchers[bit_match_rule]
+      end
+    end
+
+    matchers[route_t.match_rules] = function(route_t, ctx)
+      -- clear matches context for this try on this route
+      clear_tab(ctx.matches)
+
+      for i = 1, #matchers_set do
+        if not matchers_set[i](route_t, ctx) then
+          return
+        end
+      end
+
+      return true
+    end
+
+    return matchers[route_t.match_rules](route_t, ctx)
+  end
+end
+
+
+do
+  local reducers = {
+    [MATCH_RULES.HOST] = function(category, ctx)
+      return category.routes_by_hosts[ctx.hits.host or ctx.req_host]
+    end,
+
+    [MATCH_RULES.HEADER] = function(category, ctx)
+      return category.routes_by_headers[ctx.hits.header_name]
+    end,
+
+    [MATCH_RULES.URI] = function(category, ctx)
+      -- no ctx.req_uri indexing since regex URIs have a higher priority than
+      -- plain URIs
+      return category.routes_by_uris[ctx.hits.uri]
+    end,
+
+    [MATCH_RULES.METHOD] = function(category, ctx)
+      return category.routes_by_methods[ctx.req_method]
+    end,
+
+    [MATCH_RULES.SRC] = function(category, ctx)
+      local routes = category.routes_by_sources[ctx.src_ip]
+      if routes then
+        return routes
+      end
+
+      routes = category.routes_by_sources[ctx.src_port]
+      if routes then
+        return routes
+      end
+    end,
+
+    [MATCH_RULES.DST] = function(category, ctx)
+      local routes = category.routes_by_destinations[ctx.dst_ip]
+      if routes then
+        return routes
+      end
+
+      routes = category.routes_by_destinations[ctx.dst_port]
+      if routes then
+        return routes
+      end
+    end,
+
+    [MATCH_RULES.SNI] = function(category, ctx)
+      return category.routes_by_sni[ctx.sni]
+    end,
+  }
+
+
+  reduce = function(category, bit_category, ctx)
+    -- run cached reducer
+    if type(reducers[bit_category]) == "function" then
+      return reducers[bit_category](category, ctx), category.all
+    end
+
+    -- build and cache reducer
+
+    local reducers_set = {}
+
+    for _, bit_match_rule in ipairs(SORTED_MATCH_RULES) do
+      if band(bit_category, bit_match_rule) ~= 0 then
+        reducers_set[#reducers_set + 1] = reducers[bit_match_rule]
+      end
+    end
+
+    reducers[bit_category] = function(category, ctx)
+      local min_len = 0
+      local smallest_set
+
+      for i = 1, #reducers_set do
+        local candidates = reducers_set[i](category, ctx)
+        if candidates ~= nil and (not smallest_set or #candidates < min_len)
+        then
+          min_len = #candidates
+          smallest_set = candidates
+        end
+      end
+
+      return smallest_set
+    end
+
+    return reducers[bit_category](category, ctx), category.all
+  end
+end
+
+
+local _M = {}
+
+
+_M.has_capturing_groups = has_capturing_groups
+
+
+-- for unit-testing purposes only
+_M._set_ngx = _set_ngx
+
+
+function _M.new(routes)
+  if type(routes) ~= "table" then
+    return error("expected arg #1 routes to be a table")
+  end
+
+
+  local self = {}
+
+
+  local ctx = {
+    hits    = {},
+    matches = {},
+  }
+
+
+  -- hash table for fast lookup of plain properties
+  -- incoming requests/connections
+  local plain_indexes = {
+    hosts             = {},
+    headers           = {},
+    uris              = {},
+    methods           = {},
+    sources           = {},
+    destinations      = {},
+    snis              = {},
+  }
+
+
+  -- when hash lookup in plain_indexes fails, those are arrays
+  -- of regexes for `uris` as prefixes and `hosts` as wildcards
+  -- or IP ranges comparison functions
+  local prefix_uris    = {} -- will be sorted by length
+  local regex_uris     = {}
+  local wildcard_hosts = {}
+  local src_trust_funcs = {}
+  local dst_trust_funcs = {}
+
+
+  -- all routes grouped by the category they belong to, to reduce
+  -- iterations over sets of routes per request
+  local categories = {}
+
+
+  local cache = lrucache.new(MATCH_LRUCACHE_SIZE)
+
+
+  -- index routes
+
+  do
+    local marshalled_routes = {}
+
+    for i = 1, #routes do
+      logger.error("routes[i]:%s", cjson_safe.encode(routes[i]))
+      local route_t, err = marshall_route(routes[i])
+      logger.error("route_t:%s", cjson_safe.encode(route_t))
+      if not route_t then
+        return nil, err
+      end
+
+      marshalled_routes[i] = route_t
+    end
+
+    -- sort wildcard hosts and uri regexes since those rules
+    -- don't have their own matching category
+    --
+    -- * plain hosts > wildcard hosts
+    -- * more plain headers > less plain headers
+    -- * regex uris > plain uris
+    -- * longer plain URIs > shorter plain URIs
+
+    sort(marshalled_routes, function(r1, r2)
+      if r1.submatch_weight ~= r2.submatch_weight then
+        return r1.submatch_weight > r2.submatch_weight
+      end
+
+      do
+        local r1_n_headers = #r1.headers
+        local r2_n_headers = #r2.headers
+
+        if r1_n_headers ~= r2_n_headers then
+          return r1_n_headers > r2_n_headers
+        end
+      end
+
+      do
+        local rp1 = r1.route.regex_priority or 0
+        local rp2 = r2.route.regex_priority or 0
+
+        if rp1 ~= rp2 then
+          return rp1 > rp2
+        end
+      end
+
+      if r1.max_uri_length ~= r2.max_uri_length then
+        return r1.max_uri_length > r2.max_uri_length
+      end
+
+      if r1.route.created_at ~= nil and r2.route.created_at ~= nil then
+        return r1.route.created_at < r2.route.created_at
+      end
+    end)
+
+    for i = 1, #marshalled_routes do
+      local route_t = marshalled_routes[i]
+
+      categorize_route_t(route_t, route_t.match_rules, categories)
+      index_route_t(route_t, plain_indexes, prefix_uris, regex_uris,
+                    wildcard_hosts, src_trust_funcs, dst_trust_funcs)
+    end
+  end
+
+
+  -- a sorted array of all categories bits (from the most significant
+  -- matching-wise, to the least significant)
+  local categories_weight_sorted = {}
+
+
+  -- a lookup array to get the category_idx from a category_bit. The
+  -- idx will be a categories_weight_sorted index
+  local categories_lookup = {}
+
+
+  for category_bit, category in pairs(categories) do
+    insert(categories_weight_sorted, {
+      category_bit = category_bit,
+      match_weight = category.match_weight,
+    })
+  end
+
+  sort(categories_weight_sorted, function(c1, c2)
+    if c1.match_weight ~= c2.match_weight then
+      return c1.match_weight > c2.match_weight
+    end
+
+    return c1.category_bit > c2.category_bit
+  end)
+
+  for i, c in ipairs(categories_weight_sorted) do
+    categories_lookup[c.category_bit] = i
+  end
+
+  -- the number of categories to iterate on for this instance of the router
+  local categories_len = #categories_weight_sorted
+
+  sort(prefix_uris, function(p1, p2)
+    return #p1.value > #p2.value
+  end)
+
+  for _, category in pairs(categories) do
+    for _, routes in pairs(category.routes_by_sources) do
+      sort(routes, function(r1, r2)
+        for _, source in ipairs(r1.sources) do
+          if source.ip and source.port then
+            return true
+          end
+        end
+      end)
+    end
+
+    for _, routes in pairs(category.routes_by_destinations) do
+      sort(routes, function(r1, r2)
+        for _, destination in ipairs(r1.destinations) do
+          if destination.ip and destination.port then
+            return true
+          end
+        end
+      end)
+    end
+  end
+
+  local grab_req_headers = #plain_indexes.headers > 0
+
+  local function find_route(req_method, req_uri, req_host,
+                            src_ip, src_port,
+                            dst_ip, dst_port,
+                            sni, req_headers)
+    if req_method and type(req_method) ~= "string" then
+      error("method must be a string", 2)
+    end
+    if req_uri and type(req_uri) ~= "string" then
+      error("uri must be a string", 2)
+    end
+    if req_host and type(req_host) ~= "string" then
+      error("host must be a string", 2)
+    end
+    if src_ip and type(src_ip) ~= "string" then
+      error("src_ip must be a string", 2)
+    end
+    if src_port and type(src_port) ~= "number" then
+      error("src_port must be a number", 2)
+    end
+    if dst_ip and type(dst_ip) ~= "string" then
+      error("dst_ip must be a string", 2)
+    end
+    if dst_port and type(dst_port) ~= "number" then
+      error("dst_port must be a number", 2)
+    end
+    if sni and type(sni) ~= "string" then
+      error("sni must be a string", 2)
+    end
+    if req_headers and type(req_headers) ~= "table" then
+      error("headers must be a table", 2)
+    end
+
+    req_method = req_method or ""
+    req_uri = req_uri or ""
+    req_host = req_host or ""
+    req_headers = req_headers or EMPTY_T
+
+    ctx.req_method     = req_method
+    ctx.req_uri        = req_uri
+    ctx.req_host       = req_host
+    ctx.req_headers    = req_headers
+    ctx.src_ip         = src_ip or ""
+    ctx.src_port       = src_port or ""
+    ctx.dst_ip         = dst_ip or ""
+    ctx.dst_port       = dst_port or ""
+    ctx.sni            = sni or ""
+
+    -- cache lookup (except for headers-matched Routes)
+
+    local cache_key = req_method .. "|" .. req_uri .. "|" .. req_host ..
+                      "|" .. ctx.src_ip .. "|" .. ctx.src_port ..
+                      "|" .. ctx.dst_ip .. "|" .. ctx.dst_port ..
+                      "|" .. ctx.sni
+
+    do
+      local match_t = cache:get(cache_key)
+      if match_t then
+        return match_t
+      end
+    end
+
+    -- input sanitization for matchers
+
+    -- hosts
+
+    local raw_req_host = req_host
+
+    req_method = upper(req_method)
+
+    if req_host ~= "" then
+      -- strip port number if given because matching ignores ports
+      local idx = find(req_host, ":", 2, true)
+      if idx then
+        ctx.req_host = sub(req_host, 1, idx - 1)
+      end
+    end
+
+    local hits         = ctx.hits
+    local req_category = 0x00
+
+    clear_tab(hits)
+
+    -- router, router, which of these routes is the fairest?
+    --
+    -- determine which category this request *might* be targeting
+
+    -- host match
+
+    if plain_indexes.hosts[ctx.req_host] then
+      req_category = bor(req_category, MATCH_RULES.HOST)
+
+    elseif ctx.req_host then
+      for i = 1, #wildcard_hosts do
+        local from, _, err = re_find(ctx.req_host, wildcard_hosts[i].regex, "ajo")
+        if err then
+          log(ERR, "could not match wildcard host: ", err)
+          return
+        end
+
+        if from then
+          hits.host    = wildcard_hosts[i].value
+          req_category = bor(req_category, MATCH_RULES.HOST)
+          break
+        end
+      end
+    end
+
+    -- header match
+
+    for _, header_name in ipairs(plain_indexes.headers) do
+      if req_headers[header_name] then
+        req_category = bor(req_category, MATCH_RULES.HEADER)
+        hits.header_name = header_name
+        break
+      end
+    end
+
+    -- uri match
+
+    if plain_indexes.uris[req_uri] then
+      req_category = bor(req_category, MATCH_RULES.URI)
+
+    else
+      for i = 1, #prefix_uris do
+        if find(req_uri, prefix_uris[i].value, nil, true) == 1 then
+          hits.uri     = prefix_uris[i].value
+          req_category = bor(req_category, MATCH_RULES.URI)
+          break
+        end
+      end
+
+      for i = 1, #regex_uris do
+        local from, _, err = re_find(req_uri, regex_uris[i].regex, "ajo")
+        if err then
+          log(ERR, "could not evaluate URI regex: ", err)
+          return
+        end
+
+        if from then
+          hits.uri     = regex_uris[i].value
+          req_category = bor(req_category, MATCH_RULES.URI)
+          break
+        end
+      end
+    end
+
+    -- method match
+
+    if plain_indexes.methods[req_method] then
+      req_category = bor(req_category, MATCH_RULES.METHOD)
+    end
+
+    -- src match
+
+    if plain_indexes.sources[ctx.src_ip] then
+      req_category = bor(req_category, MATCH_RULES.SRC)
+
+    elseif plain_indexes.sources[ctx.src_port] then
+      req_category = bor(req_category, MATCH_RULES.SRC)
+
+    else
+      for i = 1, #src_trust_funcs do
+        if src_trust_funcs[i](ctx.src_ip) then
+          req_category = bor(req_category, MATCH_RULES.SRC)
+          break
+        end
+      end
+    end
+
+    -- dst match
+
+    if plain_indexes.destinations[ctx.dst_ip] then
+      req_category = bor(req_category, MATCH_RULES.DST)
+
+    elseif plain_indexes.destinations[ctx.dst_port] then
+      req_category = bor(req_category, MATCH_RULES.DST)
+
+    else
+      for i = 1, #dst_trust_funcs do
+        if dst_trust_funcs[i](ctx.dst_ip) then
+          req_category = bor(req_category, MATCH_RULES.DST)
+          break
+        end
+      end
+    end
+
+    -- sni match
+
+    if plain_indexes.snis[ctx.sni] then
+      req_category = bor(req_category, MATCH_RULES.SNI)
+    end
+
+    --print("highest potential category: ", req_category)
+
+    -- iterate from the highest matching to the lowest category to
+    -- find our route
+
+    if req_category ~= 0x00 then
+      local category_idx = categories_lookup[req_category] or 1
+      local matched_route
+
+      while category_idx <= categories_len do
+        local bit_category = categories_weight_sorted[category_idx].category_bit
+        local category     = categories[bit_category]
+
+        if category then
+          local reduced_candidates, category_candidates = reduce(category,
+                                                                 bit_category,
+                                                                 ctx)
+          if reduced_candidates then
+            -- check against a reduced set of routes that is a strong candidate
+            -- for this request, instead of iterating over all the routes of
+            -- this category
+            for i = 1, #reduced_candidates do
+              if match_route(reduced_candidates[i], ctx) then
+                matched_route = reduced_candidates[i]
+                break
+              end
+            end
+          end
+
+          if not matched_route then
+            -- no result from the reduced set, must check for results from the
+            -- full list of routes from that category before checking a lower
+            -- category
+            for i = 1, #category_candidates do
+              if match_route(category_candidates[i], ctx) then
+                matched_route = category_candidates[i]
+                break
+              end
+            end
+          end
+
+          if matched_route then
+            local upstream_host
+            local upstream_uri
+            local upstream_url_t = matched_route.upstream_url_t
+            local matches        = ctx.matches
+
+            -- Path construction
+
+            if matched_route.type == "http" then
+              -- if we do not have a path-match, then the postfix is simply the
+              -- incoming path, without the initial slash
+              local request_postfix = matches.uri_postfix or sub(req_uri, 2, -1)
+              local upstream_base = upstream_url_t.path or "/"
+
+              if matched_route.strip_uri then
+                -- we drop the matched part, replacing it with the upstream path
+                if sub(upstream_base, -1, -1) == "/" and
+                   sub(request_postfix, 1, 1) == "/" then
+                  -- double "/", so drop the first
+                  upstream_uri = sub(upstream_base, 1, -2) .. request_postfix
+
+                else
+                  upstream_uri = upstream_base .. request_postfix
+                end
+
+              else
+                -- we retain the incoming path, just prefix it with the upstream
+                -- path, but skip the initial slash
+                upstream_uri = upstream_base .. sub(req_uri, 2, -1)
+              end
+
+              -- preserve_host header logic
+
+              if matched_route.preserve_host then
+                upstream_host = raw_req_host or var.http_host
+              end
+            end
+
+            local match_t     = {
+              route           = matched_route.route,
+              service         = matched_route.service,
+              headers         = matched_route.headers,
+              upstream_url_t  = upstream_url_t,
+              upstream_scheme = upstream_url_t.scheme,
+              upstream_uri    = upstream_uri,
+              upstream_host   = upstream_host,
+              matches         = {
+                uri_captures  = matches.uri_captures,
+                uri           = matches.uri,
+                host          = matches.host,
+                headers       = matches.headers,
+                method        = matches.method,
+                src_ip        = matches.src_ip,
+                src_port      = matches.src_port,
+                dst_ip        = matches.dst_ip,
+                dst_port      = matches.dst_port,
+                sni           = matches.sni,
+              }
+            }
+
+            if band(matched_route.match_rules, MATCH_RULES.HEADER) == 0 then
+              cache:set(cache_key, match_t)
+            end
+
+            return match_t
+          end
+        end
+
+        -- check lower category
+        category_idx = category_idx + 1
+      end
+    end
+
+    -- no match :'(
+  end
+
+
+  self.select = find_route
+  self._set_ngx = _set_ngx
+
+  if subsystem == "http" then
+    function self.exec()
+      local req_method = get_method()
+      local req_uri = var.request_uri
+      local req_host = var.http_host or ""
+      local sni = var.ssl_server_name
+
+      local headers
+      local err
+
+      if grab_req_headers then
+        headers, err = get_headers(MAX_REQ_HEADERS)
+        if err == "truncated" then
+          log(WARN, "retrieved ", MAX_REQ_HEADERS, " headers for evaluation ",
+                    "(max) but request had more; other headers will be ignored")
+        end
+
+        headers["host"] = nil
+      end
+
+      do
+        local idx = find(req_uri, "?", 2, true)
+        if idx then
+          req_uri = sub(req_uri, 1, idx - 1)
+        end
+      end
+
+      local match_t = find_route(req_method, req_uri, req_host,
+                                 nil, nil, -- src_ip, src_port
+                                 nil, nil, -- dst_ip, dst_port
+                                 sni, headers)
+      if not match_t then
+        return nil
+      end
+
+      -- debug HTTP request header logic
+
+      if var.http_kong_debug then
+        if match_t.route then
+          if match_t.route.id then
+            header["Kong-Route-Id"] = match_t.route.id
+          end
+
+          if match_t.route.name then
+            header["Kong-Route-Name"] = match_t.route.name
+          end
+        end
+
+        if match_t.service then
+          if match_t.service.id then
+            header["Kong-Service-Id"] = match_t.service.id
+          end
+
+          if match_t.service.name then
+            header["Kong-Service-Name"] = match_t.service.name
+          end
+        end
+      end
+
+      return match_t
+    end
+
+  else -- stream
+    function self.exec()
+      local src_ip = var.remote_addr
+      local src_port = tonumber(var.remote_port, 10)
+      local dst_ip = var.server_addr
+      local dst_port = tonumber(var.server_port, 10)
+      local sni = var.ssl_preread_server_name
+
+      return find_route(nil, nil, nil,
+                        src_ip, src_port,
+                        dst_ip, dst_port,
+                        sni)
+    end
+  end
+
+  return self
+end
+
+
+return _M
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
